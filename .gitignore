@@ -48,4 +48,4 @@ Makefile
 .deps
 arm-openbmc-linux-gnueabi-libtool
 mboxd
-
+cscope.out
