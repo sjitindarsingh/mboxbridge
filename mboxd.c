@@ -40,20 +40,18 @@
 
 #include <mtd/mtd-abi.h>
 
-/* TODO XXX DELETE ME FIX UP */
-#include "aspeed-lpc-ctrl.h"
+#include "linux/aspeed-lpc-ctrl.h"
 
 #include "mbox.h"
 #include "common.h"
-
-#undef DEBUG_MBOX
+#include "debug.h"
 
 #define USAGE \
 "Usage: %s [ -v[v] | --verbose ] [ -s | --syslog ] [-w | --window <size>M ]\n" \
 "\t\t-f | --flash <size>[K|M]\n\n" \
 "\t-v | --verbose\tBe [more] verbose\n" \
 "\t-s | --syslog\tLog output to syslog (pointless without -v)\n" \
-"\t-w | --window\tWindow size = max(<size>, sizeof(reserved mem) (pow of 2)\n" \
+"\t-w | --window\tWindow size = min(<size>, sizeof(reserved mem)) (pow of 2)\n"\
 "\t-f | --flash\tSize of flash in [K|M] bytes\n\n"
 
 /* LPC Device Path */
@@ -69,40 +67,18 @@
 #define ALIGN_UP(val, size)	(((val) + (size) - 1) & ~((size) - 1))
 #define ALIGN_DOWN(val, size)	(val & ~((size - 1)))
 
-#define MSG_OUT(f_, ...) 	do { if (verbosity != MBOX_LOG_NONE) { \
+#define MSG_OUT(...)	 	fprintf(stderr, __VA_ARGS__)
+				/*do { if (verbosity != MBOX_LOG_NONE) { \
 				    mbox_log(LOG_INFO, f_, ##__VA_ARGS__); } } \
-				while(0)
-#define MSG_ERR(f_, ...)	do { if (verbosity != MBOX_LOG_NONE) { \
+				while(0)*/
+#define MSG_ERR(...)		fprintf(stdout, __VA_ARGS__)
+				/*do { if (verbosity != MBOX_LOG_NONE) { \
 				    mbox_log(LOG_ERR, f_, ##__VA_ARGS__); } } \
-				while(0)
+				while(0)*/
+#define DELETE_ME(...)		fprintf(stdout, __VA_ARGS__);
 
 #define BOOT_HICR7		0x30000e00U
 #define BOOT_HICR8		0xfe0001ffU
-
-struct window_context {
-	void *mem;			/* Portion of Reserved Memory Region */
-	uint32_t flash_offset;		/* Flash area the window maps (bytes) */
-	uint32_t size;			/* Size of the Window (bytes) POWER2 */
-	uint8_t *dirty_bitmap;		/* Bitmap of the dirty/erased state */
-};
-
-struct window_list {
-	int num;
-	struct window_context *window;
-};
-
-struct mbox_context {
-	enum api_version version;
-	struct pollfd fds[TOTAL_FDS];
-	struct window_list windows;	/* The "Windows" */
-	struct window_context *current;	/* The current window */
-	void *mem;			/* Reserved Memory Region */
-	uint32_t lpc_base;		/* LPC Bus Base Address (bytes) */
-	uint32_t mem_size;		/* Reserved Mem Size (bytes) */
-	uint32_t flash_size;		/* From cmdline (bytes) */
-	uint32_t block_size_shift;
-	struct mtd_info_user mtd_info;	/* Actual Flash */
-};
 
 static int sighup = 0;
 static int sigterm = 0;
@@ -559,6 +535,8 @@ static int handle_cmd_reset(struct mbox_context *context)
  * ARGS[0]: API Version
  *
  * RESP[0]: API Version
+ * RESP[1:2]: Default read window size (number of blocks)
+ * RESP[3:4]: Default write window size (number of blocks)
  * RESP[5]: Block size (as shift)
  */
 static int handle_cmd_mbox_info(struct mbox_context *context,
@@ -598,12 +576,10 @@ static int handle_cmd_mbox_info(struct mbox_context *context,
 	}
 
 	resp->args[0] = mbox_api_version;
-	if (context->version == API_VERISON_1) {
-		put_u16(&resp->args[1], context->windows.window[0].size >>
-						context->block_size_shift);
-		put_u16(&resp->args[3], context->windows.window[0].size >>
-						context->block_size_shift);
-	}
+	put_u16(&resp->args[1], context->windows.window[0].size >>
+				context->block_size_shift);
+	put_u16(&resp->args[3], context->windows.window[0].size >>
+				context->block_size_shift);
 	resp->args[5] = context->block_size_shift;
 
 	return 0;
@@ -1059,6 +1035,13 @@ static int get_message(struct mbox_context *context, union mbox_regs *msg)
 		MSG_ERR("Short read: %d expecting %zu\n", rc, sizeof(msg->msg));
 		return -1;
 	}
+	{
+		int i = 0;
+		DELETE_ME("Got Message:\n");
+		for (; i < MBOX_REG_BYTES; i++) {
+			DELETE_ME("%d: 0x%.2x\n", i, msg->raw[i]);
+		}
+	}
 
 	return 0;
 }
@@ -1108,6 +1091,7 @@ static int poll_loop(struct mbox_context *context)
 		 * poll -> disable SIGHUP again, meaning we can only take a
 		 * SIGHUP while we're polling and not while handling a request.
 		 */
+		DELETE_ME("Polling\n");
 		rc = ppoll(context->fds, POLL_FDS, &timeout, &set);
 
 		if (!rc) { /* Timeout */
@@ -1154,18 +1138,20 @@ static int poll_loop(struct mbox_context *context)
 
 /* Init Functions */
 
+#ifndef DEBUG_MBOX
 static int init_mbox_dev(struct mbox_context *context)
 {
 	int fd;
 
 	/* Open MBOX Device */
-	MSG_OUT("Opening %s\n", MBOX_HOST_PATH);
 	fd = open(MBOX_HOST_PATH, O_RDWR | O_NONBLOCK);
 	if (fd < 0) {
 		MSG_ERR("Couldn't open %s with flags O_RDWR: %s\n",
 			MBOX_HOST_PATH, strerror(errno));
 		return -errno;
 	}
+	DELETE_ME("MBOX_DEV OPENED: %d\n", fd);
+	
 
 	context->fds[MBOX_FD].fd = fd;
 	return 0;
@@ -1191,6 +1177,7 @@ static int init_lpc_dev(struct mbox_context *context)
 			LPC_CTRL_PATH, strerror(errno));
 		return -errno;
 	}
+	DELETE_ME("LPC_CTRL_DEV OPENED: %d\n", fd);
 
 	context->fds[LPC_CTRL_FD].fd = fd;
 
@@ -1205,6 +1192,8 @@ static int init_lpc_dev(struct mbox_context *context)
 	context->mem_size = map.size;
 	/* Map at the top of the 28-bit LPC firmware address space-0 */
 	context->lpc_base = 0x0FFFFFFF & -context->mem_size;
+	DELETE_ME("mem size: 0x%.8x\n", context->mem_size);
+	DELETE_ME("lpc base: 0x%.8x\n", context->lpc_base);
 	
 	/* mmap the Reserved Memory Region */
 	MSG_OUT("Mapping %s for %u\n", LPC_CTRL_PATH, context->mem_size);
@@ -1215,6 +1204,7 @@ static int init_lpc_dev(struct mbox_context *context)
 			strerror(errno));
 		return -errno;
 	}
+	DELETE_ME("Reserved mem at: 0x%.8x\n", context->mem);
 
 	return 0;
 }
@@ -1239,6 +1229,7 @@ static int init_flash_dev(struct mbox_context *context)
 		rc = -errno;
 		goto out;
 	}
+	DELETE_ME("Flash fd: %d\n", fd);
 	context->fds[MTD_FD].fd = fd;
 
 	/* Read the Flash Info */
@@ -1248,11 +1239,14 @@ static int init_flash_dev(struct mbox_context *context)
 		rc = -1;
 		goto out;
 	}
+	DELETE_ME("Flash size: %d, erase_size %d\n", context->mtd_info.size,
+			context->mtd_info.erasesize);
 
 out:
 	free(filename);
 	return rc;
 }
+#endif /* DEBUG_MBOX */
 
 static void usage(const char *name)
 {
@@ -1272,6 +1266,8 @@ static int init_window_mem(struct mbox_context *context)
 	 * will error out here
 	 */
 	for (i = 0; i < context->windows.num; i++) {
+		DELETE_ME("Window %d at 0x%.8x size 0x%.8x\n",
+				i, mem_location, context->windows.window[i].size);
 		context->windows.window[i].mem = mem_location;
 		mem_location += context->windows.window[i].size;
 		if (mem_location > (context->mem + context->mem_size)) {
@@ -1295,7 +1291,7 @@ static void init_window(struct window_context *window, uint32_t size)
 static bool parse_cmdline(int argc, char **argv,
 			  struct mbox_context *context)
 {
-	uint32_t window_size;
+	uint32_t window_size = 0;
 	char *endptr;
 	int opt, i;
 
@@ -1314,7 +1310,7 @@ static bool parse_cmdline(int argc, char **argv,
 	context->windows.window = calloc(context->windows.num,
 					 sizeof(*context->windows.window));
 
-	while ((opt = getopt_long(argc, argv, "f:wvs", long_options, NULL))
+	while ((opt = getopt_long(argc, argv, "f:w:vs", long_options, NULL))
 			!= -1) {
 		switch (opt) {
 		case 0:
@@ -1334,7 +1330,8 @@ static bool parse_cmdline(int argc, char **argv,
 				context->flash_size <<= 10;
 				break;
 			default:
-				fprintf(stderr, "Unknown units '%c'\n", *endptr);
+				fprintf(stderr, "Unknown units '%c'\n",
+					*endptr);
 				return false;
 			}
 			break;
@@ -1350,10 +1347,10 @@ static bool parse_cmdline(int argc, char **argv,
 			break;
 		case 's':
 			/* Avoid a double openlog() */
-			if (mbox_vlog != &vsyslog) {
+			/*if (mbox_vlog != &vsyslog) {
 				openlog(PREFIX, LOG_ODELAY, LOG_DAEMON);
 				mbox_vlog = &vsyslog;
-			}
+			}*/
 			break;
 		default:
 			return false;
@@ -1363,9 +1360,12 @@ static bool parse_cmdline(int argc, char **argv,
 	if (!context->flash_size) {
 		fprintf(stderr, "Must specify a non-zero flash size\n");
 		return false;
-	} else if (window_size > context->flash_size) {
+	} else if (window_size > context->flash_size || !window_size) {
 		window_size = context->flash_size;
 	}
+
+	MSG_OUT("Flash_size: %d\nWindow_size: %d\nverbosity: %d\n",
+		  context->flash_size, window_size, verbosity);
 
 	for (i = 0; i < context->windows.num; i++) {
 		init_window(&context->windows.window[i], window_size);
@@ -1424,7 +1424,12 @@ void signal_hup(int signum)
 
 void signal_term(int signum)
 {
-	sigterm = 1;
+	sigterm++;
+}
+
+void signal_int(int signum)
+{
+	sigterm++;
 }
 
 static bool register_sig_handler(int signum, void (*handler)(int))
@@ -1447,9 +1452,13 @@ int main(int argc, char **argv)
 	sigset_t set;
 	int rc, i;
 
+#ifdef DEBUG_MBOX
+	MSG_DEBUG("\n\n!!!DEBUG MODE - USING DUMMY FILES!!!\n\n");
+#endif /* DEBUG_MBOX */
+
 	context = calloc(1, sizeof(*context));
 
-	if (!parse_cmdline(argc, &argv[1], context)) {
+	if (!parse_cmdline(argc, argv, context)) {
 		usage(name);
 		exit(EXIT_FAILURE);
 	}
@@ -1460,7 +1469,7 @@ int main(int argc, char **argv)
 
 	/* Block SIGHUPs */
 	sigemptyset(&set);
-	sigaddset(&set, SIGHUP);
+	sigaddset(&set, SIGHUP | SIGTERM | SIGINT);
 	sigprocmask(SIG_SETMASK, &set, NULL);
 	/* Register Hang-Up Signal Handler */
 	if (register_sig_handler(SIGHUP, &signal_hup)) {
@@ -1473,9 +1482,13 @@ int main(int argc, char **argv)
 		perror("Registering SIGTERM");
 		exit(1);
 	}
+	if (register_sig_handler(SIGINT, &signal_int)) {
+		perror("Registering SIGINT");
+		exit(1);
+	}
 	sigterm = 0;
 
-	MSG_OUT("Starting\n");
+	MSG_OUT("Starting Daemon\n");
 
 	rc = init_mbox_dev(context);
 	if (rc) {
@@ -1517,6 +1530,7 @@ int main(int argc, char **argv)
 	MSG_OUT("Exiting Poll Loop: %d\n", rc);
 
 finish:
+	MSG_OUT("Daemon Exiting...\n");
 	if (context->mem) {
 		munmap(context->mem, context->mem_size);
 	}

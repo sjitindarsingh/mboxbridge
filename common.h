@@ -27,9 +27,9 @@ enum {
    MBOX_LOG_DEBUG = 2
 } verbosity;
 
-void (*mbox_vlog)(int p, const char *fmt, va_list args);
+void (*mbox_vlog)(int p, const char *fmt, ...);
 
-void mbox_log_console(int p, const char *fmt, va_list args);
+void mbox_log_console(int p, const char *fmt, ...);
 
 __attribute__((format(printf, 2, 3)))
 void mbox_log(int p, const char *fmt, ...);

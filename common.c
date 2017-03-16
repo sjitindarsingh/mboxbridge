@@ -26,8 +26,9 @@
 
 #include "common.h"
 
-void mbox_log_console(int p, const char *fmt, va_list args)
+void mbox_log_console(int p, const char *fmt, ...)
 {
+	va_list args;
 	struct timespec time;
 	FILE *s = (p < LOG_WARNING) ? stdout : stderr;
 

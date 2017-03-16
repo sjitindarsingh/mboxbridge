@@ -18,6 +18,8 @@
 #ifndef MBOX_H
 #define MBOX_H
 
+#include <mtd/mtd-abi.h>
+
 enum api_version {
 	API_VERISON_INVAL	= 0,
 	API_VERISON_1		= 1,
@@ -72,5 +74,37 @@ union mbox_regs {
 	char raw[MBOX_REG_BYTES];
 	struct mbox_msg msg;
 };
+
+#define MBOX_FD                 0
+#define POLL_FDS                1
+#define LPC_CTRL_FD             1
+#define MTD_FD                  2
+#define TOTAL_FDS               3
+
+struct window_context {
+        void *mem;                      /* Portion of Reserved Memory Region */
+        uint32_t flash_offset;          /* Flash area the window maps (bytes) */
+        uint32_t size;                  /* Size of the Window (bytes) POWER2 */
+        uint8_t *dirty_bitmap;          /* Bitmap of the dirty/erased state */
+};
+
+struct window_list {
+        int num; 
+        struct window_context *window;
+};
+
+struct mbox_context {
+        enum api_version version;
+        struct pollfd fds[TOTAL_FDS];
+        struct window_list windows;     /* The "Windows" */
+        struct window_context *current; /* The current window */
+        void *mem;                      /* Reserved Memory Region */
+        uint32_t lpc_base;              /* LPC Bus Base Address (bytes) */
+        uint32_t mem_size;              /* Reserved Mem Size (bytes) */
+        uint32_t flash_size;            /* From cmdline (bytes) */
+        uint32_t block_size_shift;
+        struct mtd_info_user mtd_info;  /* Actual Flash */
+};
+
 
 #endif /* MBOX_H */
