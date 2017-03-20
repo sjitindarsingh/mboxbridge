@@ -81,7 +81,9 @@
 #define BOOT_HICR8		0xfe0001ffU
 
 static int sighup = 0;
-static int sigterm = 0;
+static int sigint = 0;
+/* We need to keep track of this because we may resize windows due to V1 bugs */
+static uint32_t default_window_size = 0;
 
 static int handle_cmd_close_window(struct mbox_context *context,
 				   union mbox_regs *req);
@@ -185,6 +187,8 @@ static int write_flash(int fd, uint32_t offset, void *buf, uint32_t count)
 {
 	int rc;
 
+	MSG_OUT("Writing 0x%.8x for 0x%.8x from %p\n", offset, count, buf);
+
 	if (lseek(fd, offset, SEEK_SET) != offset) {
 		MSG_ERR("Couldn't seek flash at pos: %u %s\n", offset,
 			strerror(errno));
@@ -220,7 +224,7 @@ static int write_to_flash_dirty_v1(struct mbox_context *context,
 {
 	int rc;
 	uint32_t flash_offset;
-	struct window_context low_mem, high_mem;
+	struct window_context low_mem = { 0 }, high_mem = { 0 };
 
 	/* Find where in phys flash this is based on the window.flash_offset */
 	flash_offset = context->current->flash_offset + offset_bytes;
@@ -240,11 +244,20 @@ static int write_to_flash_dirty_v1(struct mbox_context *context,
 	high_mem.size = ALIGN_UP(high_mem.flash_offset,
 				 context->mtd_info.erasesize) -
 			high_mem.flash_offset;
+
+	DELETE_ME("Write to flash V1\n");
+	DELETE_ME("@0x%.8x for 0x%.8x\n", flash_offset, count_bytes);
+	DELETE_ME("Current Window @0x%.8x for 0x%.8x\n", context->current->flash_offset,
+			context->current->size);
+	DELETE_ME("low_mem @0x%.8x for 0x%.8x\n", low_mem.flash_offset, low_mem.size);
+	DELETE_ME("high_mem @0x%.8x for 0x%.8x\n", high_mem.flash_offset, high_mem.size);
+
 	/*
 	 * Check if we already have a copy of the required flash areas in
 	 * memory as part of the existing window
 	 */
 	if (low_mem.flash_offset < context->current->flash_offset) {
+		DELETE_ME("low_mem\n");
 		/* Before the start of our current window */
 		low_mem.mem = malloc(low_mem.size);
 		if (!low_mem.mem) {
@@ -259,6 +272,7 @@ static int write_to_flash_dirty_v1(struct mbox_context *context,
 	}
 	if ((high_mem.flash_offset + high_mem.size) >
 	    (context->current->flash_offset + context->current->size)) {
+		DELETE_ME("high_mem\n");
 		/* After the end of our current window */
 		high_mem.mem = malloc(high_mem.size);
 		if (!high_mem.mem) {
@@ -287,6 +301,7 @@ static int write_to_flash_dirty_v1(struct mbox_context *context,
 
 	/* Write back over the erased area */
 	if (low_mem.mem) {
+		DELETE_ME("low_mem\n");
 		/* Exceed window at the start */
 		rc = write_flash(context->fds[MTD_FD].fd, low_mem.flash_offset,
 				 low_mem.mem, low_mem.size);
@@ -294,15 +309,30 @@ static int write_to_flash_dirty_v1(struct mbox_context *context,
 			goto out;
 		}
 	}
+	DELETE_ME("window_mem\n");
 	rc = write_flash(context->fds[MTD_FD].fd, flash_offset,
 			 context->current->mem + offset_bytes, count_bytes);
 	if (rc < 0) {
 		goto out;
 	}
+	/*
+	 * We still need to write the last little bit that we erased - it's
+	 * either in the current window or the high_mem window.
+	 */
 	if (high_mem.mem) {
+		DELETE_ME("high_mem\n");
 		/* Exceed window at the end */
 		rc = write_flash(context->fds[MTD_FD].fd, high_mem.flash_offset,
 				 high_mem.mem, high_mem.size);
+		if (rc < 0) {
+			goto out;
+		}
+	} else {
+		DELETE_ME("window_mem\n");
+		/* Write from the current window - it's atleast that big */
+		rc = write_flash(context->fds[MTD_FD].fd, high_mem.flash_offset,
+				 context->current->mem + offset_bytes +
+				 count_bytes, high_mem.size);
 		if (rc < 0) {
 			goto out;
 		}
@@ -329,6 +359,7 @@ static int write_to_flash(struct mbox_context *context, uint32_t offset,
 
 	switch (type) {
 	case BITMAP_ERASED: /* >= V2 ONLY -> block_size == erasesize */
+		DELETE_ME("ERASE: @0x%.8x for 0x%.8x blocks\n", offset, count);
 		flash_offset = context->current->flash_offset + offset_bytes;
 		rc = erase_flash(context->fds[MTD_FD].fd, flash_offset,
 				 count_bytes);
@@ -338,6 +369,7 @@ static int write_to_flash(struct mbox_context *context, uint32_t offset,
 		}
 		break;
 	case BITMAP_DIRTY:
+		DELETE_ME("WRITE: @0x%.8x for 0x%.8x blocks\n", offset, count);
 		/*
 		 * For protocol V1, block_size may be smaller than erase size
 		 * so we have a special function to make sure that we do this
@@ -419,20 +451,25 @@ static struct window_context *search_windows(struct mbox_context *context,
 	int i = 0;
 	struct window_context *cur = &context->windows.window[i];
 
+	DELETE_ME("Searching windows\n");
 	for (; i < context->windows.num; cur = &context->windows.window[++i]) {
 		if (cur->flash_offset == (uint32_t) -1) {
+			DELETE_ME("%d: uninitialised window\n", i);
 			/* Uninitialised Window */
 			continue;
 		}
-		if ((offset > cur->flash_offset) &&
+		if ((offset >= cur->flash_offset) &&
 		    (offset < (cur->flash_offset + cur->size))) {
 			if (exact && (cur->flash_offset != offset)) {
+				DELETE_ME("%d: not exact match\n", i);
 				continue;
 			}
+			DELETE_ME("%d: match!!!\n", i);
 			/* This window contains the requested offset */
 			return cur;
 		}
 	}
+	DELETE_ME("No Match\n");
 
 	return NULL;
 }
@@ -482,11 +519,29 @@ static int create_map_window(struct mbox_context *context, uint32_t offset,
 	}
 
 	if ((offset + cur->size) > context->flash_size) {
-		/* Trying to read past the end of flash */
-		MSG_ERR("Tried to open read window past flash limit\n");
-		context->current = NULL;
-		return -MBOX_R_PARAM_ERROR;
+		/*
+		 * There is V1 skiboot implementations out there which don't
+		 * mask offset with window size, meaning when we have
+		 * window size == flash size we will never allow the host to
+		 * open a window except at 0x0, which isn't alway where the host
+		 * requests it. Thus we have to ignore this check and just
+		 * hope the host doesn't access past the end of the window
+		 * (which it shouldn't) for V1 implementations to get around
+		 * this.
+		 */
+		if (exact) {
+			cur->size = ALIGN_DOWN(context->flash_size - offset,
+					       1 << context->block_size_shift);
+		} else {
+			/* Trying to read past the end of flash */
+			MSG_ERR("Tried to open read window past flash limit\n");
+			context->current = NULL;
+			return -MBOX_R_PARAM_ERROR;
+		}
 	}
+
+	DELETE_ME("Window at 0x%.8x of size 0x%.8x maps flash 0x%.8x\n",
+			cur->mem, cur->size, offset);
 
 	/* Copy from flash into the window buffer */
 	rc = copy_flash(context->fds[MTD_FD].fd, offset, cur->mem, cur->size);
@@ -545,6 +600,8 @@ static int handle_cmd_mbox_info(struct mbox_context *context,
 	uint8_t mbox_api_version = req->msg.args[0];
 	int i, rc;
 
+	DELETE_ME("Host api version: %d\n", mbox_api_version);
+
 	/* Check we support the version requested */
 	if (mbox_api_version < API_MIN_VERISON ||
 	    mbox_api_version > API_MAX_VERSION) {
@@ -561,6 +618,8 @@ static int handle_cmd_mbox_info(struct mbox_context *context,
 		break;
 	}
 
+	DELETE_ME("block_size_shift: %d\n", context->block_size_shift);
+
 	/* Now we know the blocksize we can allocate the window dirty_bitmap */
 	for (i = 0; i < context->windows.num; i++) {
 		struct window_context *window = &context->windows.window[i];
@@ -574,6 +633,9 @@ static int handle_cmd_mbox_info(struct mbox_context *context,
 	if (rc < 0) {
 		return rc;
 	}
+
+	DELETE_ME("window size: %d\n", context->windows.window[0].size >>
+					context->block_size_shift);
 
 	resp->args[0] = mbox_api_version;
 	put_u16(&resp->args[1], context->windows.window[0].size >>
@@ -601,11 +663,19 @@ static int handle_cmd_flash_info(struct mbox_context *context,
 {
 	switch (context->version) {
 	case API_VERISON_1:
+		DELETE_ME("flash_size: 0x%.8x\n", context->flash_size);
+		DELETE_ME("erase_size: 0x%.8x\n", context->mtd_info.erasesize);
+
 		/* Both Sizes in Bytes */
 		put_u32(&resp->args[0], context->flash_size);
 		put_u32(&resp->args[4], context->mtd_info.erasesize);
 		break;
 	case API_VERISON_2:
+		DELETE_ME("flash_size: 0x%.8x\n", context->flash_size
+				>> context->block_size_shift);
+		DELETE_ME("erase_size: 0x%.8x\n", context->mtd_info.erasesize
+				>> context->block_size_shift);
+
 		/* Both Sizes in Block Size */
 		put_u16(&resp->args[0],
 			context->flash_size >> context->block_size_shift);
@@ -645,8 +715,10 @@ static int handle_cmd_read_window(struct mbox_context *context,
 	uint32_t flash_offset, size;
 	int rc;
 
+	DELETE_ME("Opening Window\n");
 	if (context->current) {
 		/* Already window open -> close it */
+		DELETE_ME("Already window open, closing it\n");
 		rc = handle_cmd_close_window(context, req);
 		if (rc < 0) {
 			return rc;
@@ -655,11 +727,13 @@ static int handle_cmd_read_window(struct mbox_context *context,
 
 	/* Offset the host has requested */
 	flash_offset = get_u16(&req->msg.args[0]) << context->block_size_shift;
+	DELETE_ME("Host req flash at 0x%.8x\n", flash_offset);
 	/* Check if we have an existing window */
 	context->current = search_windows(context, flash_offset,
 					  context->version == API_VERISON_1);
 
 	if (!context->current) { /* No existing window */
+		DELETE_ME("No existing window, mapping new one\n");
 		rc = create_map_window(context, flash_offset,
 				       context->version == API_VERISON_1);
 		if (rc < 0) { /* Unable to map offset */
@@ -690,6 +764,19 @@ static int handle_cmd_read_window(struct mbox_context *context,
 			 context->current->flash_offset))
 			>> context->block_size_shift);
 	}
+	DELETE_ME("Window made: lpc addr: 0x%.8x (0x%.8x) size: 0x%.8x"
+			" (0x%.8x)\n",
+		(context->lpc_base + (context->current->mem - context->mem) +
+		 (flash_offset - context->current->flash_offset))
+		>> context->block_size_shift,
+		context->lpc_base + (context->current->mem - context->mem) +
+		(flash_offset - context->current->flash_offset),
+		(context->current->size - (flash_offset -
+		context->current->flash_offset))
+		>> context->block_size_shift,
+		(context->current->size - (flash_offset -
+		context->current->flash_offset)));
+
 
 	return 0;
 }
@@ -720,6 +807,7 @@ static int handle_cmd_write_window(struct mbox_context *context,
 	 * This is very similar to opening a read window (exactly the same
 	 * for now infact)
 	 */
+	DELETE_ME("Write window\n");
 
 	return handle_cmd_read_window(context, req, resp);
 }
@@ -745,24 +833,29 @@ static int handle_cmd_dirty_window(struct mbox_context *context,
 {
 	uint32_t offset, size;
 
+	DELETE_ME("MARK DIRTY\n");
 	if (!context->current) {
 		MSG_ERR("Tried to call mark dirty without open window\n");
 		return -MBOX_R_PARAM_ERROR;
 	}
 
 	offset = get_u16(&req->msg.args[0]);
+	DELETE_ME("offset: 0x%.8x\n", offset);
 
 	if (context->version >= API_VERISON_2) {
 		size = get_u16(&req->msg.args[2]);
+		DELETE_ME("size: 0x%.8x blocks\n", size);
 	} else {
 		size = get_u32(&req->msg.args[2]);
+		DELETE_ME("size: 0x%.8x bytes\n", size);
 		/*
 		 * We only track dirty at the block level.
 		 * For protocol V1 we can get away with just marking the whole
 		 * block dirty.
 		 */
+		size = ALIGN_UP(size, 1 << context->block_size_shift);
 		size >>= context->block_size_shift;
-		size++;
+		DELETE_ME("size: 0x%.8x blocks\n", size);
 	}
 
 	if ((size + offset) > (context->current->size >>
@@ -799,6 +892,7 @@ static int handle_cmd_erase_window(struct mbox_context *context,
 {
 	uint32_t offset, size;
 
+	DELETE_ME("MARK ERASED\n");
 	if (context->version < API_VERISON_2) {
 		MSG_ERR("Erase command called in protocol version 1\n");
 		return -MBOX_R_PARAM_ERROR;
@@ -811,6 +905,8 @@ static int handle_cmd_erase_window(struct mbox_context *context,
 
 	offset = get_u16(&req->msg.args[0]);
 	size = get_u16(&req->msg.args[2]);
+	DELETE_ME("offset: 0x%.8x\n blocks", offset);
+	DELETE_ME("size: 0x%.8x\n blocks", size);
 
 	if ((size + offset) > (context->current->size >>
 			       context->block_size_shift)) {
@@ -833,6 +929,18 @@ static int handle_cmd_erase_window(struct mbox_context *context,
  * Command: WRITE_FLUSH
  * Flushes any dirty or erased blocks in the current window back to the backing
  * store
+ * NOTE: For V1 this behaves much the same as the dirty command in that it
+ * takes an offset and number of blocks to dirty, then also performs a flush as
+ * part of the same command. For V2 this will only flush blocks already marked
+ * dirty/erased with the appropriate commands and doesn't take any arguments
+ * directly.
+ *
+ * V1:
+ * ARGS[0:1]: Where within window to start (number of blocks)
+ * ARGS[2:5]: Number to mark dirty (number of bytes)
+ *
+ * V2:
+ * NONE
  */
 static int handle_cmd_flush_window(struct mbox_context *context,
 				   union mbox_regs *req)
@@ -840,9 +948,24 @@ static int handle_cmd_flush_window(struct mbox_context *context,
 	int rc, i, offset, count;
 	uint8_t prev;
 
+	DELETE_ME("Flushing Window\n");
 	if (!context->current) {
 		MSG_ERR("Tried to call flush without open window\n");
 		return -MBOX_R_PARAM_ERROR;
+	}
+
+	/*
+	 * For V1 the Flush command acts much the same as the dirty command
+	 * except with a flush as well. Only do this on an actual flush
+	 * command not when we call flush because we've implicitly closed a
+	 * window because we might not have the required args in req.
+	 */
+	if (context->version == API_VERISON_1 &&
+			req->msg.command == MBOX_C_WRITE_FLUSH) {
+		rc = handle_cmd_dirty_window(context, req);
+		if (rc < 0) {
+			return rc;
+		}
 	}
 
 	offset = 0;
@@ -910,13 +1033,17 @@ static int handle_cmd_close_window(struct mbox_context *context,
 {
 	int rc;
 
+	DELETE_ME("Closing window\n");
 	rc = handle_cmd_flush_window(context, req);
 	if (rc < 0) {
 		MSG_ERR("Couldn't flush window on close\n");
 		return rc;
 	}
 
+	/* We may have resized this - reset to the default */
+	context->current->size = default_window_size;
 	context->current = NULL;
+	DELETE_ME("Window Closed\n");
 
 	return 0;
 }
@@ -1039,7 +1166,7 @@ static int get_message(struct mbox_context *context, union mbox_regs *msg)
 		int i = 0;
 		DELETE_ME("Got Message:\n");
 		for (; i < MBOX_REG_BYTES; i++) {
-			DELETE_ME("%d: 0x%.2x\n", i, msg->raw[i]);
+			DELETE_ME("0x%.2x: 0x%.2x\n", i, msg->raw[i]);
 		}
 	}
 
@@ -1091,7 +1218,6 @@ static int poll_loop(struct mbox_context *context)
 		 * poll -> disable SIGHUP again, meaning we can only take a
 		 * SIGHUP while we're polling and not while handling a request.
 		 */
-		DELETE_ME("Polling\n");
 		rc = ppoll(context->fds, POLL_FDS, &timeout, &set);
 
 		if (!rc) { /* Timeout */
@@ -1110,11 +1236,18 @@ static int poll_loop(struct mbox_context *context)
 				sighup = 0;
 				continue;
 			}
-			if (errno == EINTR && sigterm) {
-				MSG_OUT("Caught SIGTERM - Exiting...\n");
+			if (errno == EINTR && sigint) {
+				MSG_OUT("Caught signal - Exiting...\n");
 				/* Probably best to do this for safety */
 				rc = point_to_flash(context);
-				sigterm = 0;
+				/* Not much we can do if this fails */
+				if (rc < 0) {
+					MSG_ERR("WARNING: Failed to point the "
+						"LPC bus back to flash\n"
+						"If the host requires "
+						"this expect problems...\n");
+				}
+				sigint = 0;
 				/* By returning we should cleanup nicely */
 				break;
 			}
@@ -1126,8 +1259,7 @@ static int poll_loop(struct mbox_context *context)
 		/* MBOX Request Received */
 		rc = dispatch_mbox(context);
 		if (rc) {
-			MSG_ERR("Error handling MBOX event: %s\n",
-				strerror(-rc));
+			MSG_ERR("Error handling MBOX event\n");
 		}
 	}
 
@@ -1291,7 +1423,6 @@ static void init_window(struct window_context *window, uint32_t size)
 static bool parse_cmdline(int argc, char **argv,
 			  struct mbox_context *context)
 {
-	uint32_t window_size = 0;
 	char *endptr;
 	int opt, i;
 
@@ -1336,7 +1467,7 @@ static bool parse_cmdline(int argc, char **argv,
 			}
 			break;
 		case 'w':
-			window_size = strtol(optarg, &endptr, 0) << 20;
+			default_window_size = strtol(optarg, &endptr, 0) << 20;
 			if (optarg == endptr || *endptr != '\0') {
 				fprintf(stderr, "Unparseable window size\n");
 				return false;
@@ -1360,15 +1491,16 @@ static bool parse_cmdline(int argc, char **argv,
 	if (!context->flash_size) {
 		fprintf(stderr, "Must specify a non-zero flash size\n");
 		return false;
-	} else if (window_size > context->flash_size || !window_size) {
-		window_size = context->flash_size;
+	} else if (default_window_size > context->flash_size ||
+			!default_window_size) {
+		default_window_size = context->flash_size;
 	}
 
 	MSG_OUT("Flash_size: %d\nWindow_size: %d\nverbosity: %d\n",
-		  context->flash_size, window_size, verbosity);
+		  context->flash_size, default_window_size, verbosity);
 
 	for (i = 0; i < context->windows.num; i++) {
-		init_window(&context->windows.window[i], window_size);
+		init_window(&context->windows.window[i], default_window_size);
 	}
 
 	if (verbosity) {
@@ -1422,31 +1554,17 @@ void signal_hup(int signum)
 	sighup = 1;
 }
 
-void signal_term(int signum)
-{
-	sigterm++;
-}
-
 void signal_int(int signum)
 {
-	sigterm++;
-}
-
-static bool register_sig_handler(int signum, void (*handler)(int))
-{
-	struct sigaction act;
-
-	act.sa_handler = handler;
-	/* We don't block any additional signals other than the trigger */
-	sigemptyset(&act.sa_mask);
-
-	return !!(sigaction(signum, &act, NULL));
+	sigint = 1;
 }
 
 /******************************************************************************/
 
 int main(int argc, char **argv)
 {
+	struct sigaction act_sighup = { 0 }, act_sigint = { 0 };
+	struct sigaction act_sigterm = { 0 };
 	struct mbox_context *context;
 	char *name = argv[0];
 	sigset_t set;
@@ -1467,26 +1585,31 @@ int main(int argc, char **argv)
 		context->fds[i].fd = -1;
 	}
 
-	/* Block SIGHUPs */
+	/* Block SIGHUPs and SIGINTs */
 	sigemptyset(&set);
-	sigaddset(&set, SIGHUP | SIGTERM | SIGINT);
+	sigaddset(&set, SIGHUP | SIGINT);
 	sigprocmask(SIG_SETMASK, &set, NULL);
 	/* Register Hang-Up Signal Handler */
-	if (register_sig_handler(SIGHUP, &signal_hup)) {
+	act_sighup.sa_handler = signal_hup;
+	sigemptyset(&act_sighup.sa_mask);
+	if (sigaction(SIGHUP, &act_sighup, NULL)) {
 		perror("Registering SIGHUP");
 		exit(1);
 	}
 	sighup = 0;
-	/* Register Terminate Signal Handler */
-	if (register_sig_handler(SIGTERM, &signal_term)) {
-		perror("Registering SIGTERM");
-		exit(1);
-	}
-	if (register_sig_handler(SIGINT, &signal_int)) {
+	/* Register Interrupt Signal Handler */
+	act_sigint.sa_handler = signal_int;
+	sigemptyset(&act_sigint.sa_mask);
+	if (sigaction(SIGINT, &act_sigint, NULL)) {
 		perror("Registering SIGINT");
 		exit(1);
 	}
-	sigterm = 0;
+	/* Register Terminate Signal Handler - Same as SIGINT */
+	if (sigaction(SIGTERM, &act_sigint, NULL)) {
+		perror("Registering SIGTERM");
+		exit(1);
+	}
+	sigint = 0;
 
 	MSG_OUT("Starting Daemon\n");
 

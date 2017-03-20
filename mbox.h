@@ -106,5 +106,4 @@ struct mbox_context {
         struct mtd_info_user mtd_info;  /* Actual Flash */
 };
 
-
 #endif /* MBOX_H */
