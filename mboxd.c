@@ -638,9 +638,9 @@ static int handle_cmd_mbox_info(struct mbox_context *context,
 					context->block_size_shift);
 
 	resp->args[0] = mbox_api_version;
-	put_u16(&resp->args[1], context->windows.window[0].size >>
+	put_u16(&resp->args[1], default_window_size >>
 				context->block_size_shift);
-	put_u16(&resp->args[3], context->windows.window[0].size >>
+	put_u16(&resp->args[3], default_window_size >>
 				context->block_size_shift);
 	resp->args[5] = context->block_size_shift;
 
