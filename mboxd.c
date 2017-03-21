@@ -512,14 +512,14 @@ static struct window_context *search_windows(struct mbox_context *context,
 	DELETE_ME("Searching windows\n");
 	for (; i < context->windows.num; cur = &context->windows.window[++i]) {
 		if (cur->flash_offset == (uint32_t) -1) {
-			DELETE_ME("%d: uninitialised window\n", i);
+			DELETE_ME("%d: NO MATCH - uninitialised\n", i);
 			/* Uninitialised Window */
 			continue;
 		}
 		if ((offset >= cur->flash_offset) &&
 		    (offset < (cur->flash_offset + cur->size))) {
 			if (exact && (cur->flash_offset != offset)) {
-				DELETE_ME("%d: not exact match\n", i);
+				DELETE_ME("%d: NO MATCH - not exact\n", i);
 				continue;
 			}
 			DELETE_ME("%d: match!!!\n", i);
@@ -527,6 +527,8 @@ static struct window_context *search_windows(struct mbox_context *context,
 			cur->age = ++max_age;
 			return cur;
 		}
+		DELETE_ME("%d: NO MATCH\n", i);
+
 	}
 	DELETE_ME("No Match\n");
 
@@ -1507,12 +1509,12 @@ static bool parse_cmdline(int argc, char **argv,
 	int opt, i;
 
 	static const struct option long_options[] = {
-		{ "flash",	required_argument,	0, 'f' },
-		{ "window-size",required_argument,	0, 'w' },
-		{ "window-num",	required_argument,	0, 'n' },
-		{ "verbose",	no_argument,		0, 'v' },
-		{ "syslog",	no_argument,		0, 's' },
-		{ 0,		0,			0, 0   }
+		{ "flash",		required_argument,	0, 'f' },
+		{ "window-size",	required_argument,	0, 'w' },
+		{ "window-num",		required_argument,	0, 'n' },
+		{ "verbose",		no_argument,		0, 'v' },
+		{ "syslog",		no_argument,		0, 's' },
+		{ 0,			0,			0, 0   }
 	};
 
 	mbox_vlog = &mbox_log_console;
@@ -1527,7 +1529,7 @@ static bool parse_cmdline(int argc, char **argv,
 		case 0:
 			break;
 		case 'f':
-			context->flash_size = strtol(optarg, &endptr, 0);
+			context->flash_size = strtol(optarg, &endptr, 10);
 			if (optarg == endptr) {
 				fprintf(stderr, "Unparseable flash size\n");
 				return false;
@@ -1547,13 +1549,15 @@ static bool parse_cmdline(int argc, char **argv,
 			}
 			break;
 		case 'n':
-			context->windows.num = strtol(optarg, &endptr, 0);
+			context->windows.num = strtol(optarg, &endptr, 10);
 			if (optarg == endptr || *endptr != '\0') {
 				fprintf(stderr, "Unparseable window num\n");
 				return false;
 			}
+			break;
 		case 'w':
-			default_window_size = strtol(optarg, &endptr, 0) << 20;
+			default_window_size = strtol(optarg, &endptr, 10);
+			default_window_size <<= 20; /* Given in MB */
 			if (optarg == endptr || *endptr != '\0') {
 				fprintf(stderr, "Unparseable window size\n");
 				return false;
@@ -1759,6 +1763,11 @@ finish:
 		close(context->fds[i].fd);
 	}
 	for (i = 0; i < context->windows.num; i++) {
+		DELETE_ME("%d window at %p mapped 0x%.8x size 0x%.8x age %d\n",
+			i, context->windows.window[i].mem,
+			context->windows.window[i].flash_offset,
+			context->windows.window[i].size,
+			context->windows.window[i].age);
 		free(context->windows.window[i].dirty_bitmap);
 	}
 	free(context->windows.window);
