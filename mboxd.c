@@ -1301,6 +1301,12 @@ static int poll_loop(struct mbox_context *context)
 		}
 		if (rc < 0) { /* Error or Signal */
 			if (errno == EINTR && sighup) {
+				/*
+				 * Something may be changing the flash behind
+				 * our backs, better to reset all the windows
+				 * to ensure we don't cache stale data.
+				 */
+				reset_windows(context);
 				rc = point_to_flash(context);
 				/* Not much we can do if this fails */
 				if (rc < 0) {
@@ -1310,12 +1316,6 @@ static int poll_loop(struct mbox_context *context)
 						"this expect problems...\n");
 				}
 				sighup = 0;
-				/*
-				 * Something may be changing the flash behind
-				 * our backs, better to reset all the windows
-				 * to ensure we don't cache stale data.
-				 */
-				reset_windows(context);
 				continue;
 			}
 			if (errno == EINTR && sigint) {
