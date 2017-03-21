@@ -991,6 +991,9 @@ static int handle_cmd_erase_window(struct mbox_context *context,
 	 * to just mark them erased
 	 */
 	memset(context->current->dirty_bitmap + offset, BITMAP_ERASED, size);
+	/* Write 0xFF to mem -> This ensures consistency between flash & ram */
+	memset(context->current->mem + (offset << context->block_size_shift),
+	       0xFF, size << context->block_size_shift);
 
 	return 0;
 }
