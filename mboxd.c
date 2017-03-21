@@ -840,6 +840,10 @@ static int handle_cmd_read_window(struct mbox_context *context,
 		context->current->flash_offset)));
 
 	context->is_write = false;
+	context->window_offset = (flash_offset - context->current->flash_offset)
+				 >> context->block_size_shift;
+	DELETE_ME("Window offset: 0x%.8x (0x%.8x)\n", context->window_offset,
+			context->window_offset << context->block_size_shift);
 
 	return 0;
 }
@@ -911,6 +915,9 @@ static int handle_cmd_dirty_window(struct mbox_context *context,
 
 	offset = get_u16(&req->msg.args[0]);
 	DELETE_ME("offset: 0x%.8x\n", offset);
+	/* We need to offset based on where in the window we pointed the host */
+	offset += context->window_offset;
+	DELETE_ME("window offset: 0x%.8x\n", offset);
 
 	if (context->version >= API_VERISON_2) {
 		size = get_u16(&req->msg.args[2]);
@@ -974,8 +981,11 @@ static int handle_cmd_erase_window(struct mbox_context *context,
 	}
 
 	offset = get_u16(&req->msg.args[0]);
-	size = get_u16(&req->msg.args[2]);
 	DELETE_ME("offset: 0x%.8x\n blocks", offset);
+	/* We need to offset based on where in the window we pointed the host */
+	offset += context->window_offset;
+	size = get_u16(&req->msg.args[2]);
+	DELETE_ME("window offset: 0x%.8x\n blocks", offset);
 	DELETE_ME("size: 0x%.8x\n blocks", size);
 
 	if ((size + offset) > (context->current->size >>
@@ -1119,6 +1129,7 @@ static int handle_cmd_close_window(struct mbox_context *context,
 	context->current->size = default_window_size;
 	context->current = NULL;
 	context->is_write = false;
+	context->window_offset = 0;
 	DELETE_ME("Window Closed\n");
 
 	return 0;

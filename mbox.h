@@ -99,6 +99,8 @@ struct mbox_context {
         struct pollfd fds[TOTAL_FDS];
         struct window_list windows;     /* The "Windows" */
         struct window_context *current; /* The current window */
+	/* Where in the current window I have pointed the host (blocks) */
+	uint32_t window_offset;
 	bool is_write;			/* Is the current window a write one */
         void *mem;                      /* Reserved Memory Region */
         uint32_t lpc_base;              /* LPC Bus Base Address (bytes) */
