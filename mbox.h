@@ -86,6 +86,7 @@ struct window_context {
         uint32_t flash_offset;          /* Flash area the window maps (bytes) */
         uint32_t size;                  /* Size of the Window (bytes) POWER2 */
         uint8_t *dirty_bitmap;          /* Bitmap of the dirty/erased state */
+	int age;			/* Used for LRU eviction scheme */
 };
 
 struct window_list {
@@ -98,6 +99,7 @@ struct mbox_context {
         struct pollfd fds[TOTAL_FDS];
         struct window_list windows;     /* The "Windows" */
         struct window_context *current; /* The current window */
+	bool is_write;			/* Is the current window a write one */
         void *mem;                      /* Reserved Memory Region */
         uint32_t lpc_base;              /* LPC Bus Base Address (bytes) */
         uint32_t mem_size;              /* Reserved Mem Size (bytes) */

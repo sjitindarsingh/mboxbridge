@@ -47,12 +47,15 @@
 #include "debug.h"
 
 #define USAGE \
-"Usage: %s [ -v[v] | --verbose ] [ -s | --syslog ] [-w | --window <size>M ]\n" \
+"Usage: %s [ -v[v] | --verbose ] [ -s | --syslog ]\n" \
+"\t\t-w | --window-size <size>M\n" \
+"\t\t-n | --window-num <num>\n" \
 "\t\t-f | --flash <size>[K|M]\n\n" \
-"\t-v | --verbose\tBe [more] verbose\n" \
-"\t-s | --syslog\tLog output to syslog (pointless without -v)\n" \
-"\t-w | --window\tWindow size = min(<size>, sizeof(reserved mem)) (pow of 2)\n"\
-"\t-f | --flash\tSize of flash in [K|M] bytes\n\n"
+"\t-v | --verbose\t\tBe [more] verbose\n" \
+"\t-s | --syslog\t\tLog output to syslog (pointless without -v)\n" \
+"\t-w | --window-size\tThe window size (power of 2) in MB\n" \
+"\t-n | --window-num\tThe number of windows\n" \
+"\t-f | --flash\t\tSize of flash in [K|M] bytes\n\n"
 
 /* LPC Device Path */
 #define LPC_CTRL_PATH		"/dev/aspeed-lpc-ctrl"
@@ -84,6 +87,18 @@ static int sighup = 0;
 static int sigint = 0;
 /* We need to keep track of this because we may resize windows due to V1 bugs */
 static uint32_t default_window_size = 0;
+/*
+ * Used to track the oldest window value for the LRU eviction scheme.
+ *
+ * Everytime a window is created/accessed it is given the max_age and max_age
+ * is incremented. This means that more recently accessed windows will have a
+ * higher age. Thus when selecting a window to evict, we simple choose the one
+ * with the lowest age and this is the least recently used (LRU) window.
+ *
+ * We could try to look at windows which are used least often rather than least
+ * recently, but an LRU scheme should suffice for now.
+ */
+static uint64_t max_age = 0;
 
 static int handle_cmd_close_window(struct mbox_context *context,
 				   union mbox_regs *req);
@@ -437,6 +452,49 @@ static int point_to_memory(struct mbox_context *context)
 	return 0;
 }
 
+/* Reset all windows to a default state */
+static void reset_windows(struct mbox_context *context)
+{
+	int i;
+
+	/* We might have an open window which needs closing/flushing */
+	if (context->current) {
+		handle_cmd_close_window(context, NULL);
+	}
+
+	for (i = 0; i < context->windows.num; i++) {
+		struct window_context *window = &context->windows.window[i];
+
+		window->flash_offset = -1;
+		window->size = default_window_size;
+		memset(window->dirty_bitmap, BITMAP_CLEAN,
+		       window->size >> context->block_size_shift);
+		window->age = 0;
+	}
+
+	max_age = 0;
+}
+
+/* Finds and returns the oldest (LRU) window */
+static struct window_context *find_oldest_window(struct mbox_context *context)
+{
+	struct window_context *oldest, *cur;
+	int i, min_age = max_age + 1;
+
+	for (i = 0; i < context->windows.num; i++) {
+		DELETE_ME("%d min_age %d cur->age %d\n", i, min_age, cur->age);
+		cur = &context->windows.window[i];
+
+		if (cur->age < min_age) {
+			DELETE_ME("Oldest!!!\n");
+			min_age = cur->age;
+			oldest = cur;
+		}
+	}
+
+	return oldest;
+}
+
 /*
  * Search window list for one containing the given offset.
  * Returns the window that maps that offset
@@ -466,6 +524,7 @@ static struct window_context *search_windows(struct mbox_context *context,
 			}
 			DELETE_ME("%d: match!!!\n", i);
 			/* This window contains the requested offset */
+			cur->age = ++max_age;
 			return cur;
 		}
 	}
@@ -502,8 +561,7 @@ static int create_map_window(struct mbox_context *context, uint32_t offset,
 
 	/* No uninitialised window found, we need to choose one to "evict" */
 	if (!context->current) {
-		/* TODO We only have one for now - later we'll have to choose */
-		context->current = cur = &context->windows.window[0];
+		context->current = cur = find_oldest_window(context);
 	}
 
 	if (!exact) {
@@ -546,6 +604,7 @@ static int create_map_window(struct mbox_context *context, uint32_t offset,
 	/* Copy from flash into the window buffer */
 	rc = copy_flash(context->fds[MTD_FD].fd, offset, cur->mem, cur->size);
 	if (rc < 0) {
+		context->current = NULL;
 		return rc;
 	}
 
@@ -555,6 +614,7 @@ static int create_map_window(struct mbox_context *context, uint32_t offset,
 
 	/* Update so we know what's in the window */
 	cur->flash_offset = offset;
+	cur->age = ++max_age;
 
 	return 0;
 }
@@ -777,6 +837,7 @@ static int handle_cmd_read_window(struct mbox_context *context,
 		(context->current->size - (flash_offset -
 		context->current->flash_offset)));
 
+	context->is_write = false;
 
 	return 0;
 }
@@ -803,13 +864,20 @@ static int handle_cmd_read_window(struct mbox_context *context,
 static int handle_cmd_write_window(struct mbox_context *context,
 				   union mbox_regs *req, struct mbox_msg *resp)
 {
+	int rc;
 	/*
 	 * This is very similar to opening a read window (exactly the same
 	 * for now infact)
 	 */
 	DELETE_ME("Write window\n");
 
-	return handle_cmd_read_window(context, req, resp);
+	rc = handle_cmd_read_window(context, req, resp);
+	if (rc < 0) {
+		return rc;
+	}
+
+	context->is_write = true;
+	return rc;
 }
 
 /*
@@ -834,8 +902,8 @@ static int handle_cmd_dirty_window(struct mbox_context *context,
 	uint32_t offset, size;
 
 	DELETE_ME("MARK DIRTY\n");
-	if (!context->current) {
-		MSG_ERR("Tried to call mark dirty without open window\n");
+	if (!context->current || !context->is_write) {
+		MSG_ERR("Tried to call mark dirty without open write window\n");
 		return -MBOX_R_PARAM_ERROR;
 	}
 
@@ -898,8 +966,8 @@ static int handle_cmd_erase_window(struct mbox_context *context,
 		return -MBOX_R_PARAM_ERROR;
 	}
 
-	if (!context->current) {
-		MSG_ERR("Tried to call erase without open window\n");
+	if (!context->current || !context->is_write) {
+		MSG_ERR("Tried to call erase without open write window\n");
 		return -MBOX_R_PARAM_ERROR;
 	}
 
@@ -949,8 +1017,8 @@ static int handle_cmd_flush_window(struct mbox_context *context,
 	uint8_t prev;
 
 	DELETE_ME("Flushing Window\n");
-	if (!context->current) {
-		MSG_ERR("Tried to call flush without open window\n");
+	if (!context->current || !context->is_write) {
+		MSG_ERR("Tried to call flush without open write window\n");
 		return -MBOX_R_PARAM_ERROR;
 	}
 
@@ -960,7 +1028,7 @@ static int handle_cmd_flush_window(struct mbox_context *context,
 	 * command not when we call flush because we've implicitly closed a
 	 * window because we might not have the required args in req.
 	 */
-	if (context->version == API_VERISON_1 &&
+	if (context->version == API_VERISON_1 && req &&
 			req->msg.command == MBOX_C_WRITE_FLUSH) {
 		rc = handle_cmd_dirty_window(context, req);
 		if (rc < 0) {
@@ -1034,15 +1102,18 @@ static int handle_cmd_close_window(struct mbox_context *context,
 	int rc;
 
 	DELETE_ME("Closing window\n");
-	rc = handle_cmd_flush_window(context, req);
-	if (rc < 0) {
-		MSG_ERR("Couldn't flush window on close\n");
-		return rc;
+	if (context->is_write) { /* Perform implicit flush */
+		rc = handle_cmd_flush_window(context, req);
+		if (rc < 0) {
+			MSG_ERR("Couldn't flush window on close\n");
+			return rc;
+		}
 	}
 
 	/* We may have resized this - reset to the default */
 	context->current->size = default_window_size;
 	context->current = NULL;
+	context->is_write = false;
 	DELETE_ME("Window Closed\n");
 
 	return 0;
@@ -1234,6 +1305,12 @@ static int poll_loop(struct mbox_context *context)
 						"this expect problems...\n");
 				}
 				sighup = 0;
+				/*
+				 * Something may be changing the flash behind
+				 * our backs, better to reset all the windows
+				 * to ensure we don't cache stale data.
+				 */
+				reset_windows(context);
 				continue;
 			}
 			if (errno == EINTR && sigint) {
@@ -1405,6 +1482,8 @@ static int init_window_mem(struct mbox_context *context)
 		if (mem_location > (context->mem + context->mem_size)) {
 			/* Tried to allocate window past the end of memory */
 			MSG_ERR("Total size of windows exceeds reserved mem\n");
+			MSG_ERR("Try smaller or fewer windows\n");
+			MSG_ERR("Mem size: 0x%.8x\n", context->mem_size);
 			return -1;
 		}
 	}
@@ -1418,6 +1497,7 @@ static void init_window(struct window_context *window, uint32_t size)
 	window->flash_offset = -1;
 	window->size = size;
 	window->dirty_bitmap = NULL;
+	window->age = 0;
 }
 
 static bool parse_cmdline(int argc, char **argv,
@@ -1428,7 +1508,8 @@ static bool parse_cmdline(int argc, char **argv,
 
 	static const struct option long_options[] = {
 		{ "flash",	required_argument,	0, 'f' },
-		{ "window",	required_argument,	0, 'w' },
+		{ "window-size",required_argument,	0, 'w' },
+		{ "window-num",	required_argument,	0, 'n' },
 		{ "verbose",	no_argument,		0, 'v' },
 		{ "syslog",	no_argument,		0, 's' },
 		{ 0,		0,			0, 0   }
@@ -1436,12 +1517,11 @@ static bool parse_cmdline(int argc, char **argv,
 
 	mbox_vlog = &mbox_log_console;
 
-	context->windows.num = 1; /* Only 1 window for now */
+	default_window_size = 0;
+	context->windows.num = 0; /* Only 1 window for now */
 	context->current = NULL; /* No current window */
-	context->windows.window = calloc(context->windows.num,
-					 sizeof(*context->windows.window));
 
-	while ((opt = getopt_long(argc, argv, "f:w:vs", long_options, NULL))
+	while ((opt = getopt_long(argc, argv, "f:w:n:vs", long_options, NULL))
 			!= -1) {
 		switch (opt) {
 		case 0:
@@ -1466,6 +1546,12 @@ static bool parse_cmdline(int argc, char **argv,
 				return false;
 			}
 			break;
+		case 'n':
+			context->windows.num = strtol(optarg, &endptr, 0);
+			if (optarg == endptr || *endptr != '\0') {
+				fprintf(stderr, "Unparseable window num\n");
+				return false;
+			}
 		case 'w':
 			default_window_size = strtol(optarg, &endptr, 0) << 20;
 			if (optarg == endptr || *endptr != '\0') {
@@ -1491,13 +1577,25 @@ static bool parse_cmdline(int argc, char **argv,
 	if (!context->flash_size) {
 		fprintf(stderr, "Must specify a non-zero flash size\n");
 		return false;
-	} else if (default_window_size > context->flash_size ||
-			!default_window_size) {
-		default_window_size = context->flash_size;
 	}
 
-	MSG_OUT("Flash_size: %d\nWindow_size: %d\nverbosity: %d\n",
-		  context->flash_size, default_window_size, verbosity);
+	if (!default_window_size) {
+		fprintf(stderr, "Must specify a non-zero window size\n");
+		return false;
+	}
+
+	if (!context->windows.num) {
+		fprintf(stderr, "Must specify a non-zero number of windows\n");
+		return false;
+	}
+
+	MSG_OUT("Flash_size: 0x%.8x\nWindow_num: %d\n"
+		"Window_size: 0x%.8x\nverbosity: %d\n",
+		  context->flash_size, context->windows.num,
+		  default_window_size, verbosity);
+
+	context->windows.window = calloc(context->windows.num,
+					 sizeof(*context->windows.window));
 
 	for (i = 0; i < context->windows.num; i++) {
 		init_window(&context->windows.window[i], default_window_size);
