@@ -653,6 +653,7 @@ static struct window_context *create_map_window(struct mbox_context *context,
  */
 static int handle_cmd_reset(struct mbox_context *context)
 {
+	reset_windows(context);
 	return point_to_flash(context);
 }
 
@@ -913,7 +914,7 @@ static int handle_cmd_write_window(struct mbox_context *context,
  * called or the window closed
  *
  * V1:
- * ARGS[0:1]: Where within window to start (number of blocks)
+ * ARGS[0:1]: Where within flash to start (number of blocks)
  * ARGS[2:5]: Number to mark dirty (number of bytes)
  *
  * V2:
@@ -928,7 +929,7 @@ static int handle_cmd_dirty_window(struct mbox_context *context,
 	DELETE_ME("MARK DIRTY\n");
 	if (!context->current || !context->is_write) {
 		MSG_ERR("Tried to call mark dirty without open write window\n");
-		return -MBOX_R_PARAM_ERROR;
+		return -MBOX_R_WINDOW_ERROR;
 	}
 
 	offset = get_u16(&req->msg.args[0]);
@@ -941,6 +942,16 @@ static int handle_cmd_dirty_window(struct mbox_context *context,
 		size = get_u16(&req->msg.args[2]);
 		DELETE_ME("size: 0x%.8x blocks\n", size);
 	} else {
+		uint32_t off;
+		/* For V1 offset is relative to flash not the current window */
+		off = offset - ((context->current->flash_offset) >>
+				context->block_size_shift);
+		if (off > offset) { /* Underflow - before current window */
+			MSG_ERR("Tried to mark dirty past window limits\n");
+			return --MBOX_R_PARAM_ERROR;
+		}
+		offset = off;
+		DELETE_ME("actual window offset: 0x%.8x\n", off);
 		size = get_u32(&req->msg.args[2]);
 		DELETE_ME("size: 0x%.8x bytes\n", size);
 		/*
@@ -995,7 +1006,7 @@ static int handle_cmd_erase_window(struct mbox_context *context,
 
 	if (!context->current || !context->is_write) {
 		MSG_ERR("Tried to call erase without open write window\n");
-		return -MBOX_R_PARAM_ERROR;
+		return -MBOX_R_WINDOW_ERROR;
 	}
 
 	offset = get_u16(&req->msg.args[0]);
@@ -1052,7 +1063,7 @@ static int handle_cmd_flush_window(struct mbox_context *context,
 	DELETE_ME("Flushing Window\n");
 	if (!context->current || !context->is_write) {
 		MSG_ERR("Tried to call flush without open write window\n");
-		return -MBOX_R_PARAM_ERROR;
+		return -MBOX_R_WINDOW_ERROR;
 	}
 
 	/*

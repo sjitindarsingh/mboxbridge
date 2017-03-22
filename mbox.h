@@ -47,6 +47,17 @@ enum api_version {
 #define MBOX_R_WRITE_ERROR		0x03
 #define MBOX_R_SYSTEM_ERROR		0x04
 #define MBOX_R_TIMEOUT			0x05
+#define MBOX_R_BUSY			0x06
+#define MBOX_R_WINDOW_ERROR		0x07
+#define MBOX_R_WINDOW_CLOSED		0x08
+
+/* Argument Flags */
+#define FLAGS_SHORT_LIFETIME		0x01
+
+/* BMC Event Notification */
+#define BMC_EVENT_REBOOT		0x01
+#define BMC_EVENT_WINDOW_RESET		0x02
+#define BMC_EVENT_FLASH_CTRL_LOST	0x04
 
 #define MBOX_HOST_PATH			"/dev/aspeed-mbox"
 #define MBOX_HOST_TIMEOUT_SEC		1
@@ -109,7 +120,7 @@ struct mbox_context {
 	/* Is the current window a write one */
 	bool is_write;
 
-/* Memory State */
+/* Memory & Flash State */
 	/* Reserved Memory Region */
         void *mem;
 	/* Reserved Mem Size (bytes) */
