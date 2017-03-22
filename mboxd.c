@@ -98,7 +98,7 @@ static uint32_t default_window_size = 0;
  * We could try to look at windows which are used least often rather than least
  * recently, but an LRU scheme should suffice for now.
  */
-static uint64_t max_age = 0;
+static uint32_t max_age = 0;
 
 static int handle_cmd_close_window(struct mbox_context *context,
 				   union mbox_regs *req);
@@ -452,6 +452,23 @@ static int point_to_memory(struct mbox_context *context)
 	return 0;
 }
 
+/* Allocates (with inital free) dirty bitmaps for windows based on block size */
+static void alloc_window_dirty_bitmap(struct mbox_context *context)
+{
+	struct window_context *window;
+	int i;
+
+	for (i = 0; i < context->windows.num; i++) {
+		window = &context->windows.window[i];
+		/* There may already be one allocated */
+		free(window->dirty_bitmap);
+		/* Allocate the new one */
+		window->dirty_bitmap = calloc((window->size >>
+					       context->block_size_shift),
+					      sizeof(*window->dirty_bitmap));
+	}
+}
+
 /* Reset all windows to a default state */
 static void reset_windows(struct mbox_context *context)
 {
@@ -467,8 +484,10 @@ static void reset_windows(struct mbox_context *context)
 
 		window->flash_offset = -1;
 		window->size = default_window_size;
-		memset(window->dirty_bitmap, BITMAP_CLEAN,
-		       window->size >> context->block_size_shift);
+		if (window->dirty_bitmap) { /* Might not have been allocated */
+			memset(window->dirty_bitmap, BITMAP_CLEAN,
+			       window->size >> context->block_size_shift);
+		}
 		window->age = 0;
 	}
 
@@ -479,11 +498,14 @@ static void reset_windows(struct mbox_context *context)
 static struct window_context *find_oldest_window(struct mbox_context *context)
 {
 	struct window_context *oldest, *cur;
-	int i, min_age = max_age + 1;
+	uint32_t min_age = max_age + 1;
+	int i;
+
+	DELETE_ME("Searching for oldest window num: %d\n", context->windows.num);
 
 	for (i = 0; i < context->windows.num; i++) {
-		DELETE_ME("%d min_age %d cur->age %d\n", i, min_age, cur->age);
 		cur = &context->windows.window[i];
+		DELETE_ME("%d min_age %u cur->age %u\n", i, min_age, cur->age);
 
 		if (cur->age < min_age) {
 			DELETE_ME("Oldest!!!\n");
@@ -544,26 +566,27 @@ static struct window_context *search_windows(struct mbox_context *context,
  *
  * offset given as absolute flash offset in bytes
  */
-static int create_map_window(struct mbox_context *context, uint32_t offset,
-			     bool exact)
+static struct window_context *create_map_window(struct mbox_context *context,
+						uint32_t offset, bool exact,
+						int *rc)
 {
 	struct window_context *cur = NULL;
-	int i, rc, size;
+	int i, size;
 
 	/* Search for an uninitialised window, use this before evicting */
-	i = 0;
-	cur = &context->windows.window[i];
-	for (; i < context->windows.num; cur = &context->windows.window[++i]) {
+	for (i = 0; i < context->windows.num; i++) {
+		cur = &context->windows.window[i];
 		if (cur->flash_offset == (uint32_t) -1) {
+			DELETE_ME("%d: Uninitialised - Using It to Map\n", i);
 			/* Uninitialised window -> use this one */
-			context->current = cur;
 			break;
 		}
 	}
 
 	/* No uninitialised window found, we need to choose one to "evict" */
-	if (!context->current) {
-		context->current = cur = find_oldest_window(context);
+	if (i == context->windows.num) {
+		DELETE_ME("No uninitialised window - evicting\n");
+		cur = find_oldest_window(context);
 	}
 
 	if (!exact) {
@@ -595,8 +618,8 @@ static int create_map_window(struct mbox_context *context, uint32_t offset,
 		} else {
 			/* Trying to read past the end of flash */
 			MSG_ERR("Tried to open read window past flash limit\n");
-			context->current = NULL;
-			return -MBOX_R_PARAM_ERROR;
+			*rc = -MBOX_R_PARAM_ERROR;
+			return NULL;
 		}
 	}
 
@@ -604,10 +627,9 @@ static int create_map_window(struct mbox_context *context, uint32_t offset,
 			cur->mem, cur->size, offset);
 
 	/* Copy from flash into the window buffer */
-	rc = copy_flash(context->fds[MTD_FD].fd, offset, cur->mem, cur->size);
-	if (rc < 0) {
-		context->current = NULL;
-		return rc;
+	*rc = copy_flash(context->fds[MTD_FD].fd, offset, cur->mem, cur->size);
+	if (*rc < 0) {
+		return NULL;
 	}
 
 	/* Clear the Dirty/Erase Bitmap */
@@ -618,7 +640,7 @@ static int create_map_window(struct mbox_context *context, uint32_t offset,
 	cur->flash_offset = offset;
 	cur->age = ++max_age;
 
-	return 0;
+	return cur;
 }
 
 /******************************************************************************/
@@ -683,12 +705,7 @@ static int handle_cmd_mbox_info(struct mbox_context *context,
 	DELETE_ME("block_size_shift: %d\n", context->block_size_shift);
 
 	/* Now we know the blocksize we can allocate the window dirty_bitmap */
-	for (i = 0; i < context->windows.num; i++) {
-		struct window_context *window = &context->windows.window[i];
-		window->dirty_bitmap = calloc((window->size >>
-					       context->block_size_shift),
-					      sizeof(*window->dirty_bitmap));
-	}
+	alloc_window_dirty_bitmap(context);
 
 	/* Point the LPC bus mapping to the reserved memory region */
 	rc = point_to_memory(context);
@@ -796,8 +813,9 @@ static int handle_cmd_read_window(struct mbox_context *context,
 
 	if (!context->current) { /* No existing window */
 		DELETE_ME("No existing window, mapping new one\n");
-		rc = create_map_window(context, flash_offset,
-				       context->version == API_VERISON_1);
+		context->current = create_map_window(context, flash_offset,
+						     context->version ==
+						     API_VERISON_1, &rc);
 		if (rc < 0) { /* Unable to map offset */
 			MSG_ERR("Couldn't create window mapping for offset %u\n"
 				, flash_offset);
@@ -1186,6 +1204,17 @@ static int handle_mbox_req(struct mbox_context *context, union mbox_regs *req)
 	int rc = 0, len;
 
 	MSG_OUT("Got data in with command %d\n", req->msg.command);
+	/* Must have already called get_mbox_info for other commands */
+	if (!context->block_size_shift &&
+			!(req->msg.command == MBOX_C_RESET_STATE ||
+			req->msg.command == MBOX_C_GET_MBOX_INFO ||
+			req->msg.command == MBOX_C_ACK)) {
+		MSG_ERR("Must call GET_MBOX_INFO before that command\n");
+		rc = -MBOX_R_PARAM_ERROR;
+		goto cmd_out;
+	}
+
+	/* Handle the command */
 	switch (req->msg.command) {
 		case MBOX_C_RESET_STATE:
 			rc = handle_cmd_reset(context);
@@ -1222,6 +1251,7 @@ static int handle_mbox_req(struct mbox_context *context, union mbox_regs *req)
 			rc = -MBOX_R_PARAM_ERROR;
 	}
 
+cmd_out:
 	if (rc < 0) {
 		MSG_ERR("Error handling mbox cmd: %d\n", req->msg.command);
 		resp.response = -rc;
@@ -1534,7 +1564,7 @@ static bool parse_cmdline(int argc, char **argv,
 	mbox_vlog = &mbox_log_console;
 
 	default_window_size = 0;
-	context->windows.num = 0; /* Only 1 window for now */
+	context->windows.num = 0;
 	context->current = NULL; /* No current window */
 
 	while ((opt = getopt_long(argc, argv, "f:w:n:vs", long_options, NULL))

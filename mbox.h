@@ -86,7 +86,7 @@ struct window_context {
         uint32_t flash_offset;          /* Flash area the window maps (bytes) */
         uint32_t size;                  /* Size of the Window (bytes) POWER2 */
         uint8_t *dirty_bitmap;          /* Bitmap of the dirty/erased state */
-	int age;			/* Used for LRU eviction scheme */
+	uint32_t age;			/* Used for LRU eviction scheme */
 };
 
 struct window_list {
@@ -95,19 +95,33 @@ struct window_list {
 };
 
 struct mbox_context {
+/* System State */
         enum api_version version;
         struct pollfd fds[TOTAL_FDS];
-        struct window_list windows;     /* The "Windows" */
-        struct window_context *current; /* The current window */
+
+/* Window State */
+	/* The window list struct containing all current "windows" */
+        struct window_list windows;
+	/* The window the host is currently pointed at */
+        struct window_context *current;
 	/* Where in the current window I have pointed the host (blocks) */
 	uint32_t window_offset;
-	bool is_write;			/* Is the current window a write one */
-        void *mem;                      /* Reserved Memory Region */
-        uint32_t lpc_base;              /* LPC Bus Base Address (bytes) */
-        uint32_t mem_size;              /* Reserved Mem Size (bytes) */
-        uint32_t flash_size;            /* From cmdline (bytes) */
+	/* Is the current window a write one */
+	bool is_write;
+
+/* Memory State */
+	/* Reserved Memory Region */
+        void *mem;
+	/* Reserved Mem Size (bytes) */
+	uint32_t mem_size;
+	/* LPC Bus Base Address (bytes) */
+        uint32_t lpc_base;
+	/* Flash size from command line (bytes) */
+        uint32_t flash_size;
+	/* Block size (as a shift) */
         uint32_t block_size_shift;
-        struct mtd_info_user mtd_info;  /* Actual Flash */
+	/* Actual Flash Info */
+        struct mtd_info_user mtd_info;
 };
 
 #endif /* MBOX_H */
