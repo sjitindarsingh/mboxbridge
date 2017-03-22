@@ -948,7 +948,7 @@ static int handle_cmd_dirty_window(struct mbox_context *context,
 				context->block_size_shift);
 		if (off > offset) { /* Underflow - before current window */
 			MSG_ERR("Tried to mark dirty past window limits\n");
-			return --MBOX_R_PARAM_ERROR;
+			return -MBOX_R_PARAM_ERROR;
 		}
 		offset = off;
 		DELETE_ME("actual window offset: 0x%.8x\n", off);
@@ -1139,10 +1139,17 @@ static int handle_cmd_flush_window(struct mbox_context *context,
  * Command: CLOSE_WINDOW
  * Close the current window
  * NOTE: There is an implicit flush
+ *
+ * V1:
+ * NONE
+ *
+ * V2:
+ * ARGS[0]: FLAGS
  */
 static int handle_cmd_close_window(struct mbox_context *context,
 				   union mbox_regs *req)
 {
+	uint8_t flags = 0;
 	int rc;
 
 	DELETE_ME("Closing window\n");
@@ -1151,6 +1158,15 @@ static int handle_cmd_close_window(struct mbox_context *context,
 		if (rc < 0) {
 			MSG_ERR("Couldn't flush window on close\n");
 			return rc;
+		}
+	}
+
+	/* Check for flags -> only if this was an explicit close command */
+	if (context->version >= API_VERISON_2 &&
+	    req->msg.command == MBOX_C_CLOSE_WINDOW) {
+		flags = req->msg.args[0];
+		if (flags & FLAGS_SHORT_LIFETIME) {
+			context->current->age = 0;
 		}
 	}
 
