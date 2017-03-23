@@ -99,9 +99,19 @@ static uint32_t default_window_size = 0;
  * recently, but an LRU scheme should suffice for now.
  */
 static uint32_t max_age = 0;
+/*
+ * We track the erased bitmap of the entire flash to avoid erasing blocks we
+ * already know to be erased.
+ */
+static struct flash_erased_bitmap {
+	uint8_t *bitmap;
+	uint32_t erase_size_shift;
+} flash_erased;
 
 static int handle_cmd_close_window(struct mbox_context *context,
 				   union mbox_regs *req);
+
+uint32_t plz_delete_me;
 
 /******************************************************************************/
 
@@ -132,6 +142,13 @@ static int point_to_flash(struct mbox_context *context)
 			strerror(errno));
 		return -MBOX_R_SYSTEM_ERROR;
 	}
+
+	/*
+	 * Since the host now has access to the flash it can change it out from
+	 * under us
+	 */
+	memset(flash_erased.bitmap,
+	       context->flash_size >> flash_erased.erase_size_shift, 0);
 
 	return 0;
 }
@@ -169,27 +186,88 @@ static int copy_flash(int fd, uint32_t offset, void *mem, uint32_t size)
 }
 
 /*
+ * Check if the section of flash containing offset (bytes) is currently erased
+ *
+ * Returns:
+ * 	TRUE  - currently erased
+ * 	FALSE - NOT currently erased
+ */
+static inline bool flash_is_erased(uint32_t offset)
+{
+	return flash_erased.bitmap[offset >> flash_erased.erase_size_shift];
+}
+
+/*
+ * Mark the section of flash containing offset (bytes) as erased for count
+ * (bytes)
+ *
+ * NOTE: marks 1 if erased == true or 0 if erased == false
+ */
+static void flash_mark_erased(uint32_t offset, uint32_t count, uint8_t erased)
+{
+	memset(flash_erased.bitmap + (offset >> flash_erased.erase_size_shift),
+	       erased,
+	       ALIGN_UP(count, 1 << flash_erased.erase_size_shift) >>
+	       flash_erased.erase_size_shift);
+}
+
+/*
  * Erase the flash at offset (bytes) for count (bytes)
  * Note: The erase ioctl will fail for an offset and count not aligned to erase
  * size
  */
 static int erase_flash(int fd, uint32_t offset, uint32_t count)
 {
+	const uint32_t erase_size = 1 << flash_erased.erase_size_shift;
+	struct erase_info_user erase_info = { 0 };
 	int rc;
 
-	struct erase_info_user erase_info = {
-		.start = offset,
-		.length = count
-	};
+	DELETE_ME("Erasing flash @0x%.8x for 0x%.8x\n", offset, count);
 
-	MSG_OUT("Erasing 0x%.8x for 0x%.8x\n", offset, count);
+	while (count) {
+		if (!flash_is_erased(offset)) { /* Need to erase this block */
+			if (!erase_info.length) { /* Start of not-erased run */
+				erase_info.start = offset;
+			}
+			erase_info.length += erase_size;
+		} else if (erase_info.length) { /* Already erased|end of run? */
+			DELETE_ME("Erasing flash @0x%.8x for 0x%.8x\n", erase_info.start, erase_info.length);
+			/* Erase the previous run which just ended */
+			rc = ioctl(fd, MEMERASE, &erase_info);
+			if (rc < 0) {
+				MSG_ERR("Couldn't erase flash at 0x%.8x\n",
+						erase_info.start);
+				return -MBOX_R_SYSTEM_ERROR;
+			}
+			/* Mark ERASED where we just erased */
+			flash_mark_erased(erase_info.start, erase_info.length,
+					  1);
+			erase_info.start = 0;
+			erase_info.length = 0;
+		}
 
-	rc = ioctl(fd, MEMERASE, &erase_info);
+		offset += erase_size;
+		count -= erase_size;
+	}
 
-	if (rc < 0) {
-		MSG_ERR("Couldn't erase flash at 0x%.8x for 0x%.8x\n",
-			offset, count);
-		return -MBOX_R_SYSTEM_ERROR;
+	if (erase_info.length) {
+		DELETE_ME("Erasing flash @0x%.8x for 0x%.8x\n", erase_info.start, erase_info.length);
+		rc = ioctl(fd, MEMERASE, &erase_info);
+		if (rc < 0) {
+			MSG_ERR("Couldn't erase flash at 0x%.8x\n",
+					erase_info.start);
+			return -MBOX_R_SYSTEM_ERROR;
+		}
+		/* Mark ERASED where we just erased */
+		flash_mark_erased(erase_info.start, erase_info.length, 1);
+	}
+
+
+	{
+		int i = 0;
+		for (; i < plz_delete_me; i += 1 << flash_erased.erase_size_shift) {
+			DELETE_ME("0x%.8x: %s\n", i, flash_is_erased(i) ? "erased" : "dirty");
+		}
 	}
 
 	return 0;
@@ -200,6 +278,7 @@ static int erase_flash(int fd, uint32_t offset, uint32_t count)
  */
 static int write_flash(int fd, uint32_t offset, void *buf, uint32_t count)
 {
+	uint32_t buf_offset = 0;
 	int rc;
 
 	MSG_OUT("Writing 0x%.8x for 0x%.8x from %p\n", offset, count, buf);
@@ -211,14 +290,23 @@ static int write_flash(int fd, uint32_t offset, void *buf, uint32_t count)
 	}
 
 	while (count) {
-		rc = write(fd, buf, count);
+		rc = write(fd, buf + buf_offset, count);
 		if (rc < 0) {
 			MSG_ERR("Couldn't write to flash, write lost: %s\n",
 				strerror(errno));
 			return -MBOX_R_WRITE_ERROR;
 		}
+		/* Mark *NOT* erased where we just wrote */
+		flash_mark_erased(offset + buf_offset, rc, 0);
 		count -= rc;
-		buf += rc;
+		buf_offset += rc;
+	}
+
+	{
+		int i = 0;
+		for (; i < plz_delete_me; i += 1 << flash_erased.erase_size_shift) {
+			DELETE_ME("0x%.8x: %s\n", i, flash_is_erased(i) ? "erased" : "dirty");
+		}
 	}
 
 	return 0;
@@ -1162,7 +1250,7 @@ static int handle_cmd_close_window(struct mbox_context *context,
 	}
 
 	/* Check for flags -> only if this was an explicit close command */
-	if (context->version >= API_VERISON_2 &&
+	if (context->version >= API_VERISON_2 && req &&
 	    req->msg.command == MBOX_C_CLOSE_WINDOW) {
 		flags = req->msg.args[0];
 		if (flags & FLAGS_SHORT_LIFETIME) {
@@ -1524,6 +1612,16 @@ static int init_flash_dev(struct mbox_context *context)
 	DELETE_ME("Flash size: %d, erase_size %d\n", context->mtd_info.size,
 			context->mtd_info.erasesize);
 
+	/* Since we know the erase sz we can allocate the flash_erased_bitmap */
+	flash_erased.erase_size_shift = log_2(context->mtd_info.erasesize);
+	flash_erased.bitmap = calloc(context->flash_size >>
+				     flash_erased.erase_size_shift,
+				     sizeof(*flash_erased.bitmap));
+	DELETE_ME("Allocated %d bytes for flash erased bitmap (%d)\n",
+		  context->flash_size >> flash_erased.erase_size_shift,
+		  flash_erased.erase_size_shift);
+	plz_delete_me = context->flash_size;
+
 out:
 	free(filename);
 	return rc;
@@ -1827,6 +1925,7 @@ int main(int argc, char **argv)
 
 finish:
 	MSG_OUT("Daemon Exiting...\n");
+	free(flash_erased.bitmap);
 	if (context->mem) {
 		munmap(context->mem, context->mem_size);
 	}
