@@ -110,6 +110,8 @@ static struct flash_erased_bitmap {
 
 static int handle_cmd_close_window(struct mbox_context *context,
 				   union mbox_regs *req);
+static int set_bmc_events(struct mbox_context *context, uint8_t bmc_event);
+static int clear_bmc_events(struct mbox_context *context, uint8_t bmc_event);
 
 uint32_t plz_delete_me;
 
@@ -906,7 +908,7 @@ static int handle_cmd_read_window(struct mbox_context *context,
 						     context->version ==
 						     API_VERISON_1, &rc);
 		if (rc < 0) { /* Unable to map offset */
-			MSG_ERR("Couldn't create window mapping for offset %u\n"
+			MSG_ERR("Couldn't create window mapping for offset 0x%.8x\n"
 				, flash_offset);
 			return rc;
 		}
@@ -1277,35 +1279,9 @@ static int handle_cmd_close_window(struct mbox_context *context,
 static int handle_cmd_ack(struct mbox_context *context, union mbox_regs *req)
 {
 	int rc;
-	uint8_t byte;
+	uint8_t bmc_events = req->msg.args[0];
 
-	/* Clear all bits except those already set but not acked */
-	byte = req->raw[MBOX_BMC_BYTE] & ~req->msg.args[0];
-
-	/* Seek mbox registers */
-	rc = lseek(context->fds[MBOX_FD].fd, MBOX_BMC_BYTE, SEEK_SET);
-	if (rc != MBOX_BMC_BYTE) {
-		MSG_ERR("Couldn't lseek mbox to byte %d: %s\n", MBOX_BMC_BYTE,
-				strerror(errno));
-		return -MBOX_R_SYSTEM_ERROR;
-	}
-
-	/* Write to mbox status register */
-	rc = write(context->fds[MBOX_FD].fd, &byte, 1);
-	if (rc != 1) {
-		MSG_ERR("Couldn't write to BMC status reg: %s\n",
-				strerror(errno));
-		return -MBOX_R_SYSTEM_ERROR;
-	}
-
-	/* Reset to start */
-	rc = lseek(context->fds[MBOX_FD].fd, 0, SEEK_SET);
-	if (rc) {
-		MSG_ERR("Couldn't reset MBOX offset to zero\n");
-		return -MBOX_R_SYSTEM_ERROR;
-	}
-
-	return 0;
+	return clear_bmc_events(context, (bmc_events & BMC_EVENT_ACK_MASK), 1);
 }
 
 static int handle_mbox_req(struct mbox_context *context, union mbox_regs *req)
@@ -1326,6 +1302,14 @@ static int handle_mbox_req(struct mbox_context *context, union mbox_regs *req)
 			req->msg.command == MBOX_C_ACK)) {
 		MSG_ERR("Must call GET_MBOX_INFO before that command\n");
 		rc = -MBOX_R_PARAM_ERROR;
+		goto cmd_out;
+	}
+	/* Check if we're in a suspended state */
+	if ((context->bmc_events & BMC_EVENT_FLASH_CTRL_LOST) &&
+			!(req->msg.command == MBOX_C_GET_MBOX_INFO ||
+			req->msg.command == MBOX_C_ACK)) {
+		MSG_OUT("Daemon suspended - returning busy\n");
+		rc = -MBOX_R_BUSY;
 		goto cmd_out;
 	}
 
@@ -1382,6 +1366,63 @@ cmd_out:
 	return rc;
 }
 
+/******************************************************************************/
+
+/* MBOX Register Access Functions */
+
+static int write_bmc_event_reg(struct mbox_context *context)
+{
+	int rc;
+
+	/* Seek mbox registers */
+	rc = lseek(context->fds[MBOX_FD].fd, MBOX_BMC_EVENT, SEEK_SET);
+	if (rc != MBOX_BMC_EVENT) {
+		MSG_ERR("Couldn't lseek mbox to byte %d: %s\n", MBOX_BMC_EVENT,
+				strerror(errno));
+		return -MBOX_R_SYSTEM_ERROR;
+	}
+
+	/* Write to mbox status register */
+	rc = write(context->fds[MBOX_FD].fd, &context->bmc_events, 1);
+	if (rc != 1) {
+		MSG_ERR("Couldn't write to BMC status reg: %s\n",
+				strerror(errno));
+		return -MBOX_R_SYSTEM_ERROR;
+	}
+
+	/* Reset to start */
+	rc = lseek(context->fds[MBOX_FD].fd, 0, SEEK_SET);
+	if (rc) {
+		MSG_ERR("Couldn't reset MBOX offset to zero: %s\n",
+				strerror(errno));
+		return -MBOX_R_SYSTEM_ERROR;
+	}
+
+	return 0;
+}
+
+/*
+ * Set the BMC Event Bits in MBOX register 15 - BMC controlled status reg
+ */
+static int set_bmc_events(struct mbox_context *context, uint8_t bmc_event,
+			  bool write_back)
+{
+	context->bmc_events |= (bmc_event & BMC_EVENT_MASK);
+
+	return write_back ? write_bmc_event_reg(context) : 0;
+}
+
+/*
+ * Clear/ACK the BMC Event Bits in MBOX register 15 - BMC controlled status reg
+ */
+static int clear_bmc_events(struct mbox_context *context, uint8_t bmc_event,
+			    bool write_back)
+{
+	context->bmc_events &= ~(bmc_event & BMC_EVENT_MASK);
+
+	return write_back ? write_bmc_event_reg(context) : 0;
+}
+
 static int get_message(struct mbox_context *context, union mbox_regs *msg)
 {
 	int rc;
@@ -1390,8 +1431,8 @@ static int get_message(struct mbox_context *context, union mbox_regs *msg)
 	if (rc < 0) {
 		MSG_ERR("Couldn't read: %s\n", strerror(errno));
 		return -errno;
-	} else if (rc < sizeof(msg->msg)) {
-		MSG_ERR("Short read: %d expecting %zu\n", rc, sizeof(msg->msg));
+	} else if (rc < sizeof(msg->raw)) {
+		MSG_ERR("Short read: %d expecting %zu\n", rc, sizeof(msg->raw));
 		return -1;
 	}
 	{
@@ -1512,6 +1553,7 @@ static int poll_loop(struct mbox_context *context)
 static int init_mbox_dev(struct mbox_context *context)
 {
 	int fd;
+	int rc;
 
 	/* Open MBOX Device */
 	fd = open(MBOX_HOST_PATH, O_RDWR | O_NONBLOCK);
@@ -1521,7 +1563,6 @@ static int init_mbox_dev(struct mbox_context *context)
 		return -errno;
 	}
 	DELETE_ME("MBOX_DEV OPENED: %d\n", fd);
-	
 
 	context->fds[MBOX_FD].fd = fd;
 	return 0;
@@ -1789,7 +1830,7 @@ static int debug_test_mbox_regs(struct mbox_context *context)
 	/* Test the single write facility by setting all the regs to 0xFF */
 	MSG_OUT("Setting all MBOX regs to 0xff individually...\n");
 	for (i = 0; i < MBOX_REG_BYTES; i++) {
-		uint8_t byte = 0xff;
+		uint8_t byte = 0x00;
 		off_t pos;
 		int len;
 
@@ -1889,6 +1930,10 @@ int main(int argc, char **argv)
 		goto finish;
 	}
 
+	if (rc) {
+		goto finish;
+	}
+
 	rc = init_lpc_dev(context);
 	if (rc) {
 		goto finish;
@@ -1917,6 +1962,11 @@ int main(int argc, char **argv)
 		goto finish;
 	}
 #endif
+
+	rc = set_bmc_events(context, BMC_EVENT_DAEMON_READY, 1);
+	if (rc) {
+		goto finish;
+	}
 
 	MSG_OUT("Entering Polling Loop\n");
 	rc = poll_loop(context);

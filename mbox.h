@@ -56,15 +56,22 @@ enum api_version {
 
 /* BMC Event Notification */
 #define BMC_EVENT_REBOOT		0x01
-#define BMC_EVENT_WINDOW_RESET		0x02
-#define BMC_EVENT_FLASH_CTRL_LOST	0x04
+#define BMC_EVENT_FLASH_MOD		0x02
+#define BMC_EVENT_ACK_MASK		(BMC_EVENT_REBOOT | \
+					BMC_EVENT_FLASH_MOD)
+#define BMC_EVENT_FLASH_CTRL_LOST	0x40
+#define BMC_EVENT_DAEMON_READY		0x80
+#define BMC_EVENT_MASK			(BMC_EVENT_REBOOT | \
+					BMC_EVENT_FLASH_MOD | \
+					BMC_EVENT_FLASH_CTRL_LOST | \
+					BMC_EVENT_DAEMON_READY)
 
 #define MBOX_HOST_PATH			"/dev/aspeed-mbox"
 #define MBOX_HOST_TIMEOUT_SEC		1
 #define MBOX_ARGS_BYTES			11
 #define MBOX_REG_BYTES			16
-#define MBOX_HOST_BYTE			14
-#define MBOX_BMC_BYTE			15
+#define MBOX_HOST_EVENT			14
+#define MBOX_BMC_EVENT			15
 
 #define BLOCK_SIZE_SHIFT_V1		12 /* 4K */
 #define POLL_TIMEOUT_S			1
@@ -109,6 +116,7 @@ struct mbox_context {
 /* System State */
         enum api_version version;
         struct pollfd fds[TOTAL_FDS];
+	uint8_t bmc_events;
 
 /* Window State */
 	/* The window list struct containing all current "windows" */
