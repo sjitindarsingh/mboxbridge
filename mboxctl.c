@@ -76,11 +76,12 @@ static int init_dbus_dev(struct mboxctl_context *context)
 }
 
 static int send_dbus_msg(struct mboxctl_context *context,
-			 struct mbox_dbus_msg *msg, uint8_t *num_args,
+			 struct mbox_dbus_msg *msg, size_t *num_args,
 			 struct mbox_dbus_msg *resp)
 {
 	sd_bus_error error = SD_BUS_ERROR_NULL;
 	sd_bus_message *m = NULL, *n = NULL;
+	int rc;
 
 	/* Generate the bus message */
 	rc = sd_bus_message_new_method_call(context->bus, &m, DBUS_NAME,
@@ -116,7 +117,7 @@ static int send_dbus_msg(struct mboxctl_context *context,
 	}
 
 	/* Send the message */
-	rc = sd_bus_call(context->bus, m, 0, error, &n);
+	rc = sd_bus_call(context->bus, m, 0, &error, &n);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to post message: %s\n", strerror(-rc));
 		goto out;
@@ -163,7 +164,7 @@ static int handle_cmd_ping(struct mboxctl_context *context)
 		.args = NULL
 	};
 	struct mbox_dbus_msg resp = { 0 };
-	uint8_t num_args = 0;
+	size_t num_args = 0;
 	int rc;
 
 	rc = send_dbus_msg(context, &msg, &num_args, &resp);
@@ -184,9 +185,9 @@ static int handle_cmd_status(struct mboxctl_context *context)
 		.args = NULL
 	};
 	struct mbox_dbus_msg resp = {
-		.args = &resp_args
+		.args = resp_args
 	};
-	uint8_t num_args = 0;
+	size_t num_args = 0;
 	int rc;
 
 	rc = send_dbus_msg(context, &msg, &num_args, &resp);
@@ -195,7 +196,7 @@ static int handle_cmd_status(struct mboxctl_context *context)
 		return 0;
 	}
 
-	if (resp.cmd != DBUS_SUCCESS) {
+	if (resp.cmd != DBUS_SUCCESS || num_args != 1) {
 		fprintf(stderr, "Status command failed\n");
 		return 0;
 	}
@@ -232,6 +233,7 @@ static int parse_cmdline(struct mboxctl_context *context, int argc, char **argv)
 			break;
 		default:
 			break;
+		}
 	}
 
 
@@ -244,7 +246,7 @@ int main(int argc, char **argv)
 	char *name = argv[0];
 	int rc;
 
-	if (argv != 2) {
+	if (argc != 2) {
 		usage(name);
 		exit(0);
 	}
