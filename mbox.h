@@ -29,6 +29,9 @@ enum api_version {
 #define API_MIN_VERISON			API_VERISON_1
 #define API_MAX_VERSION			API_VERISON_2
 
+#define THIS_NAME			"Mailbox Daemon"
+#define SUB_VERSION			0
+
 /* Command Values */
 #define MBOX_C_RESET_STATE		0x01
 #define MBOX_C_GET_MBOX_INFO		0x02
@@ -93,11 +96,13 @@ union mbox_regs {
 	struct mbox_msg msg;
 };
 
-#define MBOX_FD                 0
-#define POLL_FDS                1
-#define LPC_CTRL_FD             1
-#define MTD_FD                  2
-#define TOTAL_FDS               3
+/* Put polled file descriptors first */
+#define DBUS_FD                 0
+#define MBOX_FD			1
+#define POLL_FDS                2
+#define LPC_CTRL_FD             2
+#define MTD_FD                  3
+#define TOTAL_FDS               4
 
 struct window_context {
         void *mem;                      /* Portion of Reserved Memory Region */

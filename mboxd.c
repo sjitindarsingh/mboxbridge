@@ -39,15 +39,16 @@
 #include <inttypes.h>
 
 #include <mtd/mtd-abi.h>
-
-#include "linux/aspeed-lpc-ctrl.h"
+#include <linux/aspeed-lpc-ctrl.h>
+#include <systemd/sd-bus.h>
 
 #include "mbox.h"
 #include "common.h"
 #include "debug.h"
+#include "mbox_dbus.h"
 
 #define USAGE \
-"Usage: %s [ -v[v] | --verbose ] [ -s | --syslog ]\n" \
+"Usage: %s [--version] [-h | --help] [-v[v] | --verbose] [-s | --syslog]\n" \
 "\t\t-w | --window-size <size>M\n" \
 "\t\t-n | --window-num <num>\n" \
 "\t\t-f | --flash <size>[K|M]\n\n" \
@@ -59,13 +60,6 @@
 
 /* LPC Device Path */
 #define LPC_CTRL_PATH		"/dev/aspeed-lpc-ctrl"
-
-/* Put pulled fds first */
-#define MBOX_FD			0
-#define POLL_FDS		1
-#define LPC_CTRL_FD		1
-#define MTD_FD			2
-#define TOTAL_FDS		3
 
 #define ALIGN_UP(val, size)	(((val) + (size) - 1) & ~((size) - 1))
 #define ALIGN_DOWN(val, size)	(val & ~((size - 1)))
@@ -85,8 +79,10 @@
 
 static int sighup = 0;
 static int sigint = 0;
+
 /* We need to keep track of this because we may resize windows due to V1 bugs */
 static uint32_t default_window_size = 0;
+
 /*
  * Used to track the oldest window value for the LRU eviction scheme.
  *
@@ -99,6 +95,7 @@ static uint32_t default_window_size = 0;
  * recently, but an LRU scheme should suffice for now.
  */
 static uint32_t max_age = 0;
+
 /*
  * We track the erased bitmap of the entire flash to avoid erasing blocks we
  * already know to be erased.
@@ -108,10 +105,17 @@ static struct flash_erased_bitmap {
 	uint32_t erase_size_shift;
 } flash_erased;
 
+/* d-bus */
+#define DBUS_NAME		"org.openbmc.mboxd"
+#define DOBJ_NAME		"/org/openbmc/mboxd"
+static sd_bus *bus;
+
 static int handle_cmd_close_window(struct mbox_context *context,
 				   union mbox_regs *req);
-static int set_bmc_events(struct mbox_context *context, uint8_t bmc_event);
-static int clear_bmc_events(struct mbox_context *context, uint8_t bmc_event);
+static int set_bmc_events(struct mbox_context *context, uint8_t bmc_event,
+			  bool write_back);
+static int clear_bmc_events(struct mbox_context *context, uint8_t bmc_event,
+			    bool write_back);
 
 uint32_t plz_delete_me;
 
@@ -1368,6 +1372,105 @@ cmd_out:
 
 /******************************************************************************/
 
+/* DBUS Functions */
+
+/*
+ * Command: DBUS Ping
+ * Ping the daemon
+ *
+ * Args: NONE
+ * Resp: NONE
+ */
+static int dbus_handle_ping(void)
+{
+	return 0;
+}
+
+/*
+ * Command: DBUS Status
+ * Get the status of the daemon
+ *
+ * Args: NONE
+ * Resp[0]: Status Code
+ */
+static int dbus_handle_status(struct mbox_context *context,
+			      struct mbox_dbus_msg *resp)
+{
+	resp->args[0] = (context->bmc_events & BMC_EVENT_FLASH_CTRL_LOST) ?
+			STATUS_SUSPENDED : STATUS_ACTIVE;
+
+	return 0;
+}
+
+static int method_cmd(sd_bus_message *m, void *userdata,
+		      sd_bus_error *ret_error)
+{
+	struct mbox_dbus_msg req = { 0 }, resp = { 0 };
+	struct mbox_context *context;
+	size_t num_args = 0;
+	sd_bus_message *n;
+	int rc;
+
+	context = (struct mbox_context *) userdata;
+	if (!context) {
+		MSG_ERR("DBUS Internal Error\n");
+		resp.cmd = E_DBUS_INTERNAL;
+		goto out;
+	}
+
+	/* Read the command */
+	rc = sd_bus_message_read(m, "y", &req.cmd);
+	if (rc < 0) {
+		MSG_ERR("DBUS error reading message: %s\n", strerror(-rc));
+		resp.cmd = E_DBUS_INTERNAL;
+		goto out;
+	}
+
+	/* Read the args */
+	rc = sd_bus_message_read_array(m, 'y', (const void **) &req.args,
+				       &num_args);
+	if (rc < 0) {
+		MSG_ERR("DBUS error reading message: %s\n", strerror(-rc));
+		resp.cmd = E_DBUS_INTERNAL;
+		goto out;
+	}
+
+	/* Handle the command */
+	switch (req.cmd) {
+	case DBUS_C_PING:
+		num_args = 0;
+		dbus_handle_ping();
+		break;
+	case DBUS_C_STATUS:
+		num_args = 1;
+		resp.args = calloc(num_args, sizeof(*resp.args));
+		dbus_handle_status(context, &resp);
+		break;
+	default:
+		num_args = 0;
+		resp.cmd = E_DBUS_INVAL;
+		MSG_ERR("Received unknown dbus cmd: %d\n", req.cmd);
+		break;
+	}
+
+out:
+	sd_bus_message_new_method_return(m, &n); /* Generate response */
+	sd_bus_message_append(n, "y", resp.cmd); /* Set return code */
+	sd_bus_message_append_array(n, 'y', resp.args, num_args); /* Ret args */
+	sd_bus_send(bus, n, NULL); /* Send response */
+	free(resp.args);
+	return 0;
+}
+
+static const sd_bus_vtable mboxd_vtable[] = {
+	SD_BUS_VTABLE_START(0),
+	SD_BUS_METHOD("cmd", "yay", "yay", &method_cmd,
+		      SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_VTABLE_END
+};
+
+/******************************************************************************/
+
 /* MBOX Register Access Functions */
 
 static int write_bmc_event_reg(struct mbox_context *context)
@@ -1465,10 +1568,13 @@ static int dispatch_mbox(struct mbox_context *context)
 static int poll_loop(struct mbox_context *context)
 {
 	sigset_t set;
-	int rc = 0;
+	int rc = 0, i;
 
 	sigemptyset(&set);
-	context->fds[MBOX_FD].events = POLLIN;
+	/* Set POLLIN on polling file descriptors */
+	for (i = 0; i < POLL_FDS; i++) {
+		context->fds[i].events = POLLIN;
+	}
 
 	while (1) {
 		const struct timespec timeout = {
@@ -1535,10 +1641,21 @@ static int poll_loop(struct mbox_context *context)
 			break;
 		}
 
-		/* MBOX Request Received */
-		rc = dispatch_mbox(context);
-		if (rc) {
-			MSG_ERR("Error handling MBOX event\n");
+		/* Event on Polled File Descriptor - Handle It */
+		if (context->fds[DBUS_FD].revents & POLLIN) {
+			DELETE_ME("DBUS event\n");
+			while (rc = sd_bus_process(bus, NULL) > 0);
+			if (rc < 0) {
+				MSG_ERR("Error handling DBUS event: %s\n",
+						strerror(-rc));
+			}
+		}
+		if (context->fds[MBOX_FD].revents & POLLIN) {
+			DELETE_ME("MBOX event\n");
+			rc = dispatch_mbox(context);
+			if (rc < 0) {
+				MSG_ERR("Error handling MBOX event\n");
+			}
 		}
 	}
 
@@ -1669,9 +1786,44 @@ out:
 }
 #endif /* DEBUG_MBOX */
 
+static int init_dbus_dev(struct mbox_context *context)
+{
+	int rc;
+
+	rc = sd_bus_default_system(&bus);
+	if (rc < 0) {
+		MSG_ERR("Failed to connect to the system bus: %s\n",
+			strerror(-rc));
+		return rc;
+	}
+
+	rc = sd_bus_add_object_vtable(bus, NULL, DOBJ_NAME, DBUS_NAME,
+				      mboxd_vtable, context);
+	if (rc < 0) {
+		MSG_ERR("Failed to register vtable: %s\n", strerror(-rc));
+		return rc;
+	}
+
+	rc = sd_bus_request_name(bus, DBUS_NAME, SD_BUS_NAME_ALLOW_REPLACEMENT |
+						 SD_BUS_NAME_REPLACE_EXISTING);
+	if (rc < 0) {
+		MSG_ERR("Failed to acquire service name: %s\n", strerror(-rc));
+		return rc;
+	}
+
+	rc = sd_bus_get_fd(bus);
+	if (rc < 0) {
+		MSG_ERR("Failed to get bus fd: %s\n", strerror(-rc));
+		return rc;
+	}
+
+	context->fds[DBUS_FD].fd = rc;
+	return 0;
+}
+
 static void usage(const char *name)
 {
-	fprintf(stderr, USAGE, name);
+	printf(USAGE, name);
 }
 
 static int init_window_mem(struct mbox_context *context)
@@ -1724,6 +1876,8 @@ static bool parse_cmdline(int argc, char **argv,
 		{ "window-num",		required_argument,	0, 'n' },
 		{ "verbose",		no_argument,		0, 'v' },
 		{ "syslog",		no_argument,		0, 's' },
+		{ "version",		no_argument,		0, 'z' },
+		{ "help",		no_argument,		0, 'h' },
 		{ 0,			0,			0, 0   }
 	};
 
@@ -1733,7 +1887,7 @@ static bool parse_cmdline(int argc, char **argv,
 	context->windows.num = 0;
 	context->current = NULL; /* No current window */
 
-	while ((opt = getopt_long(argc, argv, "f:w:n:vs", long_options, NULL))
+	while ((opt = getopt_long(argc, argv, "f:w:n:vsh", long_options, NULL))
 			!= -1) {
 		switch (opt) {
 		case 0:
@@ -1783,6 +1937,12 @@ static bool parse_cmdline(int argc, char **argv,
 				mbox_vlog = &vsyslog;
 			}*/
 			break;
+		case 'z':
+			printf("%s v%d.%.2d\n", THIS_NAME, API_MAX_VERSION,
+						SUB_VERSION);
+			exit(0);
+		case 'h':
+			return false; /* This will print the usage message */
 		default:
 			return false;
 		}
@@ -1890,7 +2050,7 @@ int main(int argc, char **argv)
 
 	if (!parse_cmdline(argc, argv, context)) {
 		usage(name);
-		exit(EXIT_FAILURE);
+		exit(0);
 	}
 
 	for (i = 0; i < TOTAL_FDS; i++) {
@@ -1950,6 +2110,11 @@ int main(int argc, char **argv)
 		goto finish;
 	}
 
+	rc = init_dbus_dev(context);
+	if (rc) {
+		goto finish;
+	}
+
 	/* Set the LPC bus mapping to point to the physical flash device */
 	rc = point_to_flash(context);
 	if (rc) {
@@ -1975,6 +2140,10 @@ int main(int argc, char **argv)
 
 finish:
 	MSG_OUT("Daemon Exiting...\n");
+	clear_bmc_events(context, BMC_EVENT_DAEMON_READY, 1);
+
+	sd_bus_unref(bus);
+
 	free(flash_erased.bitmap);
 	if (context->mem) {
 		munmap(context->mem, context->mem_size);
