@@ -81,6 +81,7 @@ static int send_dbus_msg(struct mboxctl_context *context,
 {
 	sd_bus_error error = SD_BUS_ERROR_NULL;
 	sd_bus_message *m = NULL, *n = NULL;
+	uint8_t *buf;
 	int rc;
 
 	/* Generate the bus message */
@@ -108,14 +109,6 @@ static int send_dbus_msg(struct mboxctl_context *context,
 		goto out;
 	}
 
-	{
-		int i;
-		printf("%d: [%d]\n", msg->cmd, *num_args);
-		for (i = 0; i < *num_args; i++) {
-			printf("%d: %d\n", i, msg->args[i]);
-		}
-	}
-
 	/* Send the message */
 	rc = sd_bus_call(context->bus, m, 0, &error, &n);
 	if (rc < 0) {
@@ -132,7 +125,7 @@ static int send_dbus_msg(struct mboxctl_context *context,
 	}
 
 	/* Read response args */
-	rc = sd_bus_message_read_array(n, 'y', (const void **) &resp->args,
+	rc = sd_bus_message_read_array(n, 'y', (const void **) &buf,
 				       num_args);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to read response args: %s\n",
@@ -140,14 +133,7 @@ static int send_dbus_msg(struct mboxctl_context *context,
 		goto out;
 	}
 
-	rc = 0;
-	{
-		int i;
-		printf("%d: [%d]\n", resp->cmd, *num_args);
-		for (i = 0; i < *num_args; i++) {
-			printf("%d: %d\n", i, resp->args[i]);
-		}
-	}
+	memcpy(resp->args, buf, *num_args);
 
 out:
 	sd_bus_error_free(&error);
@@ -179,29 +165,31 @@ static int handle_cmd_ping(struct mboxctl_context *context)
 
 static int handle_cmd_status(struct mboxctl_context *context)
 {
-	uint8_t resp_args[1];
 	struct mbox_dbus_msg msg = {
 		.cmd = DBUS_C_STATUS,
 		.args = NULL
 	};
-	struct mbox_dbus_msg resp = {
-		.args = resp_args
-	};
+	struct mbox_dbus_msg resp = { 0 };
 	size_t num_args = 0;
 	int rc;
+
+	resp.args = calloc(1, sizeof(*resp.args));
 
 	rc = send_dbus_msg(context, &msg, &num_args, &resp);
 	if (rc < 0) {
 		fprintf(stderr, "Failed to send status command\n");
-		return 0;
+		goto out;
 	}
 
 	if (resp.cmd != DBUS_SUCCESS || num_args != 1) {
 		fprintf(stderr, "Status command failed\n");
-		return 0;
+		goto out;
 	}
 
 	printf("Daemon Status: %s\n", resp.args[0] ? "Suspended" : "Active");
+
+out:
+	free(resp.args);
 	return 0;
 }
 
@@ -218,7 +206,8 @@ static int parse_cmdline(struct mboxctl_context *context, int argc, char **argv)
 		{ 0,		0,		0, 0   }
 	};
 
-	while (opt = getopt_long(argc, argv, "psvh", long_options, NULL) != -1)
+	while ((opt = getopt_long(argc, argv, "psvh", long_options, NULL))
+			!= -1)
 	{
 		switch (opt) {
 		case 'p':
@@ -245,7 +234,7 @@ int main(int argc, char **argv)
 	struct mboxctl_context context;
 	char *name = argv[0];
 	int rc;
-
+	
 	if (argc != 2) {
 		usage(name);
 		exit(0);
