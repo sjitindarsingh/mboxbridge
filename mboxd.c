@@ -106,8 +106,6 @@ static struct flash_erased_bitmap {
 } flash_erased;
 
 /* d-bus */
-#define DBUS_NAME		"org.openbmc.mboxd"
-#define DOBJ_NAME		"/org/openbmc/mboxd"
 static sd_bus *bus;
 
 static int handle_cmd_close_window(struct mbox_context *context,
