@@ -64,15 +64,15 @@
 #define ALIGN_UP(val, size)	(((val) + (size) - 1) & ~((size) - 1))
 #define ALIGN_DOWN(val, size)	(val & ~((size - 1)))
 
-#define MSG_OUT(...)	 	fprintf(stderr, __VA_ARGS__)
-				/*do { if (verbosity != MBOX_LOG_NONE) { \
+#define MSG_OUT(...)		fprintf(stdout, __VA_ARGS__);
+				/*do { if (verbosity >= MBOX_LOG_DEBUG) { \
 				    mbox_log(LOG_INFO, f_, ##__VA_ARGS__); } } \
 				while(0)*/
-#define MSG_ERR(...)		fprintf(stdout, __VA_ARGS__)
-				/*do { if (verbosity != MBOX_LOG_NONE) { \
+#define MSG_ERR(...)		fprintf(stderr, __VA_ARGS__);
+				/*do { if (verbosity >= MBOX_LOG_VERBOSE) { \
 				    mbox_log(LOG_ERR, f_, ##__VA_ARGS__); } } \
 				while(0)*/
-#define DELETE_ME(...)		fprintf(stdout, __VA_ARGS__);
+#define DELETE_ME(...)		/*fprintf(stdout, __VA_ARGS__);*/do {;} while(0)
 
 #define BOOT_HICR7		0x30000e00U
 #define BOOT_HICR8		0xfe0001ffU
@@ -115,8 +115,6 @@ static int set_bmc_events(struct mbox_context *context, uint8_t bmc_event,
 			  bool write_back);
 static int clr_bmc_events(struct mbox_context *context, uint8_t bmc_event,
 			    bool write_back);
-
-uint32_t plz_delete_me;
 
 /******************************************************************************/
 
@@ -267,14 +265,6 @@ static int erase_flash(int fd, uint32_t offset, uint32_t count)
 		flash_mark_erased(erase_info.start, erase_info.length, 1);
 	}
 
-
-	{
-		int i = 0;
-		for (; i < plz_delete_me; i += 1 << flash_erased.erase_size_shift) {
-			DELETE_ME("0x%.8x: %s\n", i, flash_is_erased(i) ? "erased" : "dirty");
-		}
-	}
-
 	return 0;
 }
 
@@ -305,13 +295,6 @@ static int write_flash(int fd, uint32_t offset, void *buf, uint32_t count)
 		flash_mark_erased(offset + buf_offset, rc, 0);
 		count -= rc;
 		buf_offset += rc;
-	}
-
-	{
-		int i = 0;
-		for (; i < plz_delete_me; i += 1 << flash_erased.erase_size_shift) {
-			DELETE_ME("0x%.8x: %s\n", i, flash_is_erased(i) ? "erased" : "dirty");
-		}
 	}
 
 	return 0;
@@ -782,6 +765,7 @@ static int handle_cmd_mbox_info(struct mbox_context *context,
 				union mbox_regs *req, struct mbox_msg *resp)
 {
 	uint8_t mbox_api_version = req->msg.args[0];
+	uint8_t old_api_version = context->version;
 	int i, rc;
 
 	DELETE_ME("Host api version: %d\n", mbox_api_version);
@@ -804,8 +788,15 @@ static int handle_cmd_mbox_info(struct mbox_context *context,
 
 	DELETE_ME("block_size_shift: %d\n", context->block_size_shift);
 
+	/* Reset if we were V1 since this required exact window mapping */
+	if (old_api_version == API_VERISON_1) {
+		reset_windows(context, 0); /* NOTE: No flush */
+	}
 	/* Now we know the blocksize we can allocate the window dirty_bitmap */
-	alloc_window_dirty_bitmap(context);
+	if (mbox_api_version != old_api_version) {
+		DELETE_ME("Version changed\n");
+		alloc_window_dirty_bitmap(context);
+	}
 
 	/* Point the LPC bus mapping to the reserved memory region */
 	rc = point_to_memory(context);
@@ -1946,7 +1937,6 @@ static int init_flash_dev(struct mbox_context *context)
 	DELETE_ME("Allocated %d bytes for flash erased bitmap (%d)\n",
 		  context->flash_size >> flash_erased.erase_size_shift,
 		  flash_erased.erase_size_shift);
-	plz_delete_me = context->flash_size;
 
 out:
 	free(filename);
