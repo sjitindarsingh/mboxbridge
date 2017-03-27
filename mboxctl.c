@@ -43,7 +43,7 @@
 #include "mbox_dbus.h"
 
 #define USAGE \
-"Usage: %s <command> [args]\n\n" \
+"\nUsage: %s <command> [args]\n\n" \
 "\tCommands:\n" \
 "\t\t--ping\t\t\t- ping the daemon (args: 0)\n" \
 "\t\t--status\t\t- check status of the daemon (args: 0)\n" \
@@ -81,6 +81,8 @@ static inline const char *parse_error(int error_val)
 		return "Failed - Request Rejected by Daemon";
 	case E_DBUS_HARDWARE:
 		return "Failed - BMC Hardware Error";
+	case E_DBUS_NOOP:
+		return "Failed - Rejected Operation Would Have No Effect";
 	default:
 		return "Failed - Unknown Error";
 	}
@@ -324,11 +326,16 @@ static int parse_cmdline(struct mboxctl_context *context, int argc, char **argv)
 		{ "point-to-flash",	no_argument,		0, 'f' },
 		{ "suspend",		no_argument,		0, 'u' },
 		{ "resume",		required_argument,	0, 'e' },
-		{ "flash_modified",	no_argument,		0, 'm' },
+		{ "flash-modified",	no_argument,		0, 'm' },
 		{ "version",		no_argument,		0, 'v' },
 		{ "help",		no_argument,		0, 'h' },
 		{ 0,			0,			0, 0   }
 	};
+
+	if (argc <= 1) {
+		usage(argv[0]);
+		return -E_DBUS_INVAL;
+	}
 
 	while ((opt = getopt_long(argc, argv, "psrfs:umvh", long_options, NULL))
 			!= -1)

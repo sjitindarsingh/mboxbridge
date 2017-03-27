@@ -48,7 +48,7 @@
 #include "mbox_dbus.h"
 
 #define USAGE \
-"Usage: %s [--version] [-h | --help] [-v[v] | --verbose] [-s | --syslog]\n" \
+"\nUsage: %s [--version] [-h | --help] [-v[v] | --verbose] [-s | --syslog]\n" \
 "\t\t-w | --window-size <size>M\n" \
 "\t\t-n | --window-num <num>\n" \
 "\t\t-f | --flash <size>[K|M]\n\n" \
@@ -112,7 +112,7 @@ static int handle_cmd_close_window(struct mbox_context *context,
 				   union mbox_regs *req);
 static int set_bmc_events(struct mbox_context *context, uint8_t bmc_event,
 			  bool write_back);
-static int clear_bmc_events(struct mbox_context *context, uint8_t bmc_event,
+static int clr_bmc_events(struct mbox_context *context, uint8_t bmc_event,
 			    bool write_back);
 
 uint32_t plz_delete_me;
@@ -1287,7 +1287,7 @@ static int handle_cmd_ack(struct mbox_context *context, union mbox_regs *req)
 	int rc;
 	uint8_t bmc_events = req->msg.args[0];
 
-	return clear_bmc_events(context, (bmc_events & BMC_EVENT_ACK_MASK), 1);
+	return clr_bmc_events(context, (bmc_events & BMC_EVENT_ACK_MASK), 1);
 }
 
 static int handle_mbox_req(struct mbox_context *context, union mbox_regs *req)
@@ -1417,6 +1417,20 @@ static int dbus_handle_reset(struct mbox_context *context,
 {
 	int rc;
 
+	/* We don't let the host access flash if the daemon is suspened */
+	if (context->bmc_events & BMC_EVENT_FLASH_CTRL_LOST) {
+		resp->cmd = E_DBUS_REJECTED;
+		return -MBOX_R_PARAM_ERROR;
+	}
+
+	/* Tell the host its windows have been reset */
+	rc = set_bmc_events(context, BMC_EVENT_WINDOW_RESET, 1);
+	if (rc < 0) {
+		resp->cmd = E_DBUS_HARDWARE;
+		/* Better not reset them since we failed to notify the host */
+		return rc;
+	}
+
 	/*
 	 * This will close (and flush) the current window and point the lpc bus
 	 * mapping back to flash.
@@ -1424,10 +1438,10 @@ static int dbus_handle_reset(struct mbox_context *context,
 	rc = handle_cmd_reset(context);
 
 	if (rc < 0) {
-		resp.cmd = E_DBUS_HARDWARE;
+		resp->cmd = E_DBUS_HARDWARE;
 	}
 
-	return 0;
+	return rc;
 }
 
 /*
@@ -1440,6 +1454,97 @@ static int dbus_handle_reset(struct mbox_context *context,
  * Args: NONE
  * Resp: NONE
  */
+static int dbus_handle_modified(struct mbox_context *context,
+				struct mbox_dbus_msg *resp)
+{
+	int rc;
+
+	/* Tell the host its windows have been reset */
+	rc = set_bmc_events(context, BMC_EVENT_WINDOW_RESET, 1);
+	if (rc < 0) {
+		resp->cmd = E_DBUS_HARDWARE;
+		/* Better not reset them since we failed to notify the host */
+		return rc;
+	}
+
+	/*
+	 * This will close the current window and invalidate all windows.
+	 * NOTE: we don't flush the current window since there may be
+	 * inconsistencies between the flash and data in memory
+	 */
+	reset_windows(context, false);
+
+	return 0;
+}
+
+/*
+ * Command: DBUS Suspend
+ * Suspend the daemon to inhibit it from performing flash accesses.
+ * This is used to synchronise access to the flash between the daemon and
+ * directly from the BMC.
+ *
+ * Args: NONE
+ * Resp: NONE
+ */
+static int dbus_handle_suspend(struct mbox_context *context,
+			       struct mbox_dbus_msg *resp)
+{
+	int rc;
+
+	if (context->bmc_events & BMC_EVENT_FLASH_CTRL_LOST) {
+		/* Already Suspended */
+		resp->cmd = E_DBUS_NOOP;
+		return -MBOX_R_PARAM_ERROR;
+	}
+
+	/* Nothing to check - Just set the bit to notify the host */
+	rc = set_bmc_events(context, BMC_EVENT_FLASH_CTRL_LOST, 1);
+	if (rc < 0) {
+		resp->cmd = E_DBUS_HARDWARE;
+	}
+
+	return rc;
+}
+
+/*
+ * Command: DBUS Resume
+ * Resume the daemon to let it perform flash accesses again.
+ *
+ * Args[0]: Flash Modified (0 - no | 1 - yes)
+ * Resp: NONE
+ */
+static int dbus_handle_resume(struct mbox_context *context,
+			      struct mbox_dbus_msg *req,
+			      struct mbox_dbus_msg *resp)
+{
+	int rc;
+
+	if (req->num_args != 1) {
+		resp->cmd = E_DBUS_INVAL;
+		return -MBOX_R_PARAM_ERROR;
+	}
+
+	if (!(context->bmc_events & BMC_EVENT_FLASH_CTRL_LOST)) {
+		/* We weren't suspended... */
+		resp->cmd = E_DBUS_NOOP;
+		return -MBOX_R_PARAM_ERROR;
+	}
+
+	if (req->args[0] == RESUME_FLASH_MODIFIED) {
+		DELETE_ME("Flash Modified\n");
+		/* Clear the bit and call the flash modified handler */
+		clr_bmc_events(context, BMC_EVENT_FLASH_CTRL_LOST, 0);
+		return dbus_handle_modified(context, resp);
+	}
+
+	/* Flash wasn't modified - just clear the bit with writeback */
+	rc = clr_bmc_events(context, BMC_EVENT_FLASH_CTRL_LOST, 1);
+	if (rc < 0) {
+		resp->cmd = E_DBUS_HARDWARE;
+	}
+
+	return rc;
+}
 
 static int method_cmd(sd_bus_message *m, void *userdata,
 		      sd_bus_error *ret_error)
@@ -1572,8 +1677,8 @@ static int set_bmc_events(struct mbox_context *context, uint8_t bmc_event,
 /*
  * Clear/ACK the BMC Event Bits in MBOX register 15 - BMC controlled status reg
  */
-static int clear_bmc_events(struct mbox_context *context, uint8_t bmc_event,
-			    bool write_back)
+static int clr_bmc_events(struct mbox_context *context, uint8_t bmc_event,
+			  bool write_back)
 {
 	context->bmc_events &= ~(bmc_event & BMC_EVENT_MASK);
 
@@ -2195,7 +2300,7 @@ int main(int argc, char **argv)
 
 finish:
 	MSG_OUT("Daemon Exiting...\n");
-	clear_bmc_events(context, BMC_EVENT_DAEMON_READY, 1);
+	clr_bmc_events(context, BMC_EVENT_DAEMON_READY, 1);
 
 	sd_bus_unref(bus);
 
