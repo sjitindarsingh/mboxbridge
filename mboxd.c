@@ -562,12 +562,16 @@ static void alloc_window_dirty_bitmap(struct mbox_context *context)
 }
 
 /* Reset all windows to a default state */
-static void reset_windows(struct mbox_context *context)
+static void reset_windows(struct mbox_context *context, bool do_flush)
 {
 	int i;
 
 	/* We might have an open window which needs closing/flushing */
 	if (context->current) {
+		if (!do_flush) {
+			/* Stop the close command from flushing the window */
+			context->is_write = false;
+		}
 		handle_cmd_close_window(context, NULL);
 	}
 
@@ -745,7 +749,7 @@ static struct window_context *create_map_window(struct mbox_context *context,
  */
 static int handle_cmd_reset(struct mbox_context *context)
 {
-	reset_windows(context);
+	reset_windows(context, true);
 	return point_to_flash(context);
 }
 
@@ -1400,12 +1404,48 @@ static int dbus_handle_status(struct mbox_context *context,
 	return 0;
 }
 
+/*
+ * Command: DBUS Reset
+ * Reset the daemon state, final operation TBA.
+ * For now we just point the lpc mapping back at the flash.
+ *
+ * Args: NONE
+ * Resp: NONE
+ */
+static int dbus_handle_reset(struct mbox_context *context,
+			     struct mbox_dbus_msg *resp)
+{
+	int rc;
+
+	/*
+	 * This will close (and flush) the current window and point the lpc bus
+	 * mapping back to flash.
+	 */
+	rc = handle_cmd_reset(context);
+
+	if (rc < 0) {
+		resp.cmd = E_DBUS_HARDWARE;
+	}
+
+	return 0;
+}
+
+/*
+ * Command: DBUS Flash Modified
+ * Used to notify the daemon that the flash has been modified out from under
+ * it - We need to reset all out windows to ensure flash will be reloaded
+ * when a new window is opened.
+ * Note: We don't flush any previously opened windowsa
+ *
+ * Args: NONE
+ * Resp: NONE
+ */
+
 static int method_cmd(sd_bus_message *m, void *userdata,
 		      sd_bus_error *ret_error)
 {
 	struct mbox_dbus_msg req = { 0 }, resp = { 0 };
 	struct mbox_context *context;
-	size_t num_args = 0;
 	sd_bus_message *n;
 	int rc;
 
@@ -1426,7 +1466,7 @@ static int method_cmd(sd_bus_message *m, void *userdata,
 
 	/* Read the args */
 	rc = sd_bus_message_read_array(m, 'y', (const void **) &req.args,
-				       &num_args);
+				       &req.num_args);
 	if (rc < 0) {
 		MSG_ERR("DBUS error reading message: %s\n", strerror(-rc));
 		resp.cmd = E_DBUS_INTERNAL;
@@ -1436,16 +1476,32 @@ static int method_cmd(sd_bus_message *m, void *userdata,
 	/* Handle the command */
 	switch (req.cmd) {
 	case DBUS_C_PING:
-		num_args = 0;
+		DELETE_ME("Ping\n");
 		dbus_handle_ping();
 		break;
 	case DBUS_C_STATUS:
-		num_args = 1;
-		resp.args = calloc(num_args, sizeof(*resp.args));
+		DELETE_ME("Status\n");
+		resp.num_args = 1;
+		resp.args = calloc(resp.num_args, sizeof(*resp.args));
 		dbus_handle_status(context, &resp);
 		break;
+	case DBUS_C_RESET:
+		DELETE_ME("Reset\n");
+		dbus_handle_reset(context, &resp);
+		break;
+	case DBUS_C_SUSPEND:
+		DELETE_ME("Suspend\n");
+		dbus_handle_suspend(context, &resp);
+		break;
+	case DBUS_C_RESUME:
+		DELETE_ME("Resume\n");
+		dbus_handle_resume(context, &req, &resp);
+		break;
+	case DBUS_C_MODIFIED:
+		DELETE_ME("Modified\n");
+		dbus_handle_modified(context, &resp);
+		break;
 	default:
-		num_args = 0;
 		resp.cmd = E_DBUS_INVAL;
 		MSG_ERR("Received unknown dbus cmd: %d\n", req.cmd);
 		break;
@@ -1454,7 +1510,7 @@ static int method_cmd(sd_bus_message *m, void *userdata,
 out:
 	sd_bus_message_new_method_return(m, &n); /* Generate response */
 	sd_bus_message_append(n, "y", resp.cmd); /* Set return code */
-	sd_bus_message_append_array(n, 'y', resp.args, num_args); /* Ret args */
+	sd_bus_message_append_array(n, 'y', resp.args, resp.num_args);
 	sd_bus_send(bus, n, NULL); /* Send response */
 	free(resp.args);
 	return 0;
@@ -1606,9 +1662,9 @@ static int poll_loop(struct mbox_context *context)
 				 * Something may be changing the flash behind
 				 * our backs, better to reset all the windows
 				 * to ensure we don't cache stale data.
+				 * Note we flush the current window.
 				 */
-				reset_windows(context);
-				rc = point_to_flash(context);
+				rc = handle_cmd_reset(context);
 				/* Not much we can do if this fails */
 				if (rc < 0) {
 					MSG_ERR("WARNING: Failed to point the "
@@ -1622,6 +1678,7 @@ static int poll_loop(struct mbox_context *context)
 			if (errno == EINTR && sigint) {
 				MSG_OUT("Caught signal - Exiting...\n");
 				/* Probably best to do this for safety */
+				/* Note we don't flush the current window */
 				rc = point_to_flash(context);
 				/* Not much we can do if this fails */
 				if (rc < 0) {

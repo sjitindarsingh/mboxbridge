@@ -24,12 +24,22 @@
 /* Commands */
 #define DBUS_C_PING		0x00
 #define	DBUS_C_STATUS		0x01
+#define DBUS_C_RESET		0x02
+#define DBUS_C_SUSPEND		0x03
+#define DBUS_C_RESUME		0x04
+#define DBUS_C_MODIFIED		0x05
+
+/* Command Args */
+/* Resume */
+#define RESUME_NOT_MODIFIED	0x00
+#define RESUME_FLASH_MODIFIED	0x01
 
 /* Return Values */
-#define DBUS_SUCCESS		0x00
-#define E_DBUS_INTERNAL		0x01
-#define E_DBUS_INVAL		0x02
-#define E_DBUS_REJECTED		0x03
+#define DBUS_SUCCESS		0x00 /* Command Succeded */
+#define E_DBUS_INTERNAL		0x01 /* Internal DBUS Error */
+#define E_DBUS_INVAL		0x02 /* Invalid Command */
+#define E_DBUS_REJECTED		0x03 /* Daemon Rejected Request */
+#define E_DBUS_HARDWARE		0x04 /* BMC Hardware Error */
 
 /* Response Args */
 /* Status */
@@ -38,6 +48,7 @@
 
 struct mbox_dbus_msg {
 	uint8_t cmd;
+	size_t num_args;
 	uint8_t *args;
 };
 
