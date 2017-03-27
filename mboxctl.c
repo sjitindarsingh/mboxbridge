@@ -43,10 +43,12 @@
 #include "mbox_dbus.h"
 
 #define USAGE \
-"\nUsage: %s <command> [args]\n\n" \
+"\nUsage: %s [--silent | -s] <command> [args]\n\n" \
+"\t\t--silent\t\t- no output on the command line\n\n" \
 "\tCommands:\n" \
 "\t\t--ping\t\t\t- ping the daemon (args: 0)\n" \
 "\t\t--status\t\t- check status of the daemon (args: 0)\n" \
+"\t\t--kill\t\t- stop the daemon without flushing any open window (args: 0)\n" \
 "\t\t--reset\t\t\t- hard reset the daemon state (args: 0)\n" \
 "\t\t--point-to-flash\t- point the lpc mapping back to flash (args: 0)\n" \
 "\t\t--suspend\t\t- suspend the daemon to inhibit flash accesses (args: 0)\n" \
@@ -58,13 +60,22 @@
 #define VERSION		1
 #define SUBVERSION	0
 
+static bool silent;
+
+#define MSG_OUT(...)	do { if (!silent) { \
+				fprintf(stdout, __VA_ARGS__); } \
+			} while (0)
+#define MSG_ERR(...)	do { if (!silent) { \
+				fprintf(stderr, __VA_ARGS__); } \
+			} while (0)
+
 struct mboxctl_context {
 	sd_bus *bus;
 };
 
 static void usage(char *name)
 {
-	printf(USAGE, name);
+	MSG_OUT(USAGE, name);
 	exit(0);
 }
 
@@ -94,7 +105,7 @@ static int init_dbus_dev(struct mboxctl_context *context)
 
 	rc = sd_bus_default_system(&context->bus);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to connect to the system bus: %s\n",
+		MSG_ERR("Failed to connect to the system bus: %s\n",
 			strerror(-rc));
 	}
 
@@ -115,7 +126,7 @@ static int send_dbus_msg(struct mboxctl_context *context,
 	rc = sd_bus_message_new_method_call(context->bus, &m, DBUS_NAME,
 					    DOBJ_NAME, DBUS_NAME, "cmd");
 	if (rc < 0) {
-		fprintf(stderr, "Failed to init method call: %s\n",
+		MSG_ERR("Failed to init method call: %s\n",
 			strerror(-rc));
 		goto out;
 	}
@@ -123,7 +134,7 @@ static int send_dbus_msg(struct mboxctl_context *context,
 	/* Add the command */
 	rc = sd_bus_message_append(m, "y", msg->cmd);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to add cmd to message: %s\n",
+		MSG_ERR("Failed to add cmd to message: %s\n",
 			strerror(-rc));
 		goto out;
 	}
@@ -131,7 +142,7 @@ static int send_dbus_msg(struct mboxctl_context *context,
 	/* Add the args */
 	rc = sd_bus_message_append_array(m, 'y', msg->args, msg->num_args);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to add args to message: %s\n",
+		MSG_ERR("Failed to add args to message: %s\n",
 			strerror(-rc));
 		goto out;
 	}
@@ -139,14 +150,14 @@ static int send_dbus_msg(struct mboxctl_context *context,
 	/* Send the message */
 	rc = sd_bus_call(context->bus, m, 0, &error, &n);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to post message: %s\n", strerror(-rc));
+		MSG_ERR("Failed to post message: %s\n", strerror(-rc));
 		goto out;
 	}
 
 	/* Read response code */
 	rc = sd_bus_message_read(n, "y", &resp->cmd);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to read response code: %s\n",
+		MSG_ERR("Failed to read response code: %s\n",
 			strerror(-rc));
 		goto out;
 	}
@@ -154,13 +165,13 @@ static int send_dbus_msg(struct mboxctl_context *context,
 	/* Read response args */
 	rc = sd_bus_message_read_array(n, 'y', (const void **) &buf, &sz);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to read response args: %s\n",
+		MSG_ERR("Failed to read response args: %s\n",
 			strerror(-rc));
 		goto out;
 	}
 
 	if (sz < resp->num_args) {
-		fprintf(stderr, "Command returned insufficient response args\n");
+		MSG_ERR("Command returned insufficient response args\n");
 		rc = -E_DBUS_INTERNAL;
 		goto out;
 	}
@@ -185,12 +196,12 @@ static int handle_cmd_ping(struct mboxctl_context *context)
 
 	rc = send_dbus_msg(context, &msg, &resp);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to send ping command\n");
+		MSG_ERR("Failed to send ping command\n");
 		goto out;
 	}
 
 	rc = -resp.cmd;
-	printf("Ping: %s\n", parse_error(resp.cmd));
+	MSG_OUT("Ping: %s\n", parse_error(resp.cmd));
 
 out:
 	return rc;
@@ -207,21 +218,41 @@ static int handle_cmd_status(struct mboxctl_context *context)
 
 	rc = send_dbus_msg(context, &msg, &resp);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to send status command\n");
+		MSG_ERR("Failed to send status command\n");
 		goto out;
 	}
 
 	rc = -resp.cmd;
 	if (resp.cmd != DBUS_SUCCESS) {
-		fprintf(stderr, "Status command failed\n");
+		MSG_ERR("Status command failed\n");
 		goto out;
 	}
 
-	printf("Daemon Status: %s\n", resp.args[0] == STATUS_ACTIVE ? "Active" :
-				      "Suspended");
+	MSG_OUT("Daemon Status: %s\n", resp.args[0] == STATUS_ACTIVE ? "Active"
+				       : "Suspended");
 
 out:
 	free(resp.args);
+	return rc;
+}
+
+static int handle_cmd_kill(struct mboxctl_context *context)
+{
+	struct mbox_dbus_msg msg = { 0 }, resp = { 0 };
+	int rc;
+
+	msg.cmd = DBUS_C_KILL;
+
+	rc = send_dbus_msg(context, &msg, &resp);
+	if (rc < 0) {
+		MSG_ERR("Failed to send kill command\n");
+		goto out;
+	}
+
+	rc = -resp.cmd;
+	MSG_OUT("Kill: %s\n", parse_error(resp.cmd));
+
+out:
 	return rc;
 }
 
@@ -234,12 +265,12 @@ static int handle_cmd_reset(struct mboxctl_context *context)
 
 	rc = send_dbus_msg(context, &msg, &resp);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to send reset command\n");
+		MSG_ERR("Failed to send reset command\n");
 		goto out;
 	}
 
 	rc = -resp.cmd;
-	printf("Reset: %s\n", parse_error(resp.cmd));
+	MSG_OUT("Reset: %s\n", parse_error(resp.cmd));
 
 out:
 	return rc;
@@ -254,12 +285,12 @@ static int handle_cmd_suspend(struct mboxctl_context *context)
 
 	rc = send_dbus_msg(context, &msg, &resp);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to send suspend command\n");
+		MSG_ERR("Failed to send suspend command\n");
 		goto out;
 	}
 
 	rc = -resp.cmd;
-	printf("Suspend: %s\n", parse_error(resp.cmd));
+	MSG_OUT("Suspend: %s\n", parse_error(resp.cmd));
 
 out:
 	return rc;
@@ -270,7 +301,8 @@ static int handle_cmd_resume(struct mboxctl_context *context, char *arg)
 	struct mbox_dbus_msg msg = { 0 }, resp = { 0 };
 	int rc;
 
-	if (!arg || *arg != '0' || *arg != '1') {
+	if (!arg || (*arg != '0' && *arg != '1')) {
+		MSG_ERR("Resume command takes argument <0|1>\n");
 		rc = -E_DBUS_INVAL;
 		goto out;
 	}
@@ -283,12 +315,12 @@ static int handle_cmd_resume(struct mboxctl_context *context, char *arg)
 
 	rc = send_dbus_msg(context, &msg, &resp);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to send resume command\n");
+		MSG_ERR("Failed to send resume command\n");
 		goto out;
 	}
 
 	rc = -resp.cmd;
-	printf("Resume: %s\n", parse_error(resp.cmd));
+	MSG_OUT("Resume: %s\n", parse_error(resp.cmd));
 
 out:
 	return rc;
@@ -303,12 +335,12 @@ static int handle_cmd_modified(struct mboxctl_context *context)
 
 	rc = send_dbus_msg(context, &msg, &resp);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to send flash modified command\n");
+		MSG_ERR("Failed to send flash modified command\n");
 		goto out;
 	}
 
 	rc = -resp.cmd;
-	printf("Flash Modified: %s\n", parse_error(resp.cmd));
+	MSG_OUT("Flash Modified: %s\n", parse_error(resp.cmd));
 
 out:
 	free(msg.args);
@@ -320,8 +352,10 @@ static int parse_cmdline(struct mboxctl_context *context, int argc, char **argv)
 	int opt, rc = -1;
 
 	static const struct option long_options[] = {
+		{ "silent",		no_argument,		0, 's' },
 		{ "ping",		no_argument,		0, 'p' },
-		{ "status",		no_argument,		0, 's' },
+		{ "status",		no_argument,		0, 't' },
+		{ "kill",		no_argument,		0, 'k' },
 		{ "reset",		no_argument,		0, 'r' },
 		{ "point-to-flash",	no_argument,		0, 'f' },
 		{ "suspend",		no_argument,		0, 'u' },
@@ -337,15 +371,21 @@ static int parse_cmdline(struct mboxctl_context *context, int argc, char **argv)
 		return -E_DBUS_INVAL;
 	}
 
-	while ((opt = getopt_long(argc, argv, "psrfue:mvh", long_options, NULL))
-			!= -1)
+	while ((opt = getopt_long(argc, argv, "sptkrfue:mvh", long_options, NULL)
+		) != -1)
 	{
 		switch (opt) {
+		case 's':
+			silent = true;
+			continue;
 		case 'p':
 			rc = handle_cmd_ping(context);
 			break;
-		case 's':
+		case 't':
 			rc = handle_cmd_status(context);
+			break;
+		case 'k':
+			rc = handle_cmd_kill(context);
 			break;
 		case 'r': /* These are the same for now (reset may change) */
 		case 'f':
@@ -361,7 +401,7 @@ static int parse_cmdline(struct mboxctl_context *context, int argc, char **argv)
 			rc = handle_cmd_modified(context);
 			break;
 		case 'v':
-			printf("%s V%d.%.2d\n", NAME, VERSION, SUBVERSION);
+			MSG_OUT("%s V%d.%.2d\n", NAME, VERSION, SUBVERSION);
 			rc = 0;
 			break;
 		case 'h':
@@ -382,10 +422,12 @@ int main(int argc, char **argv)
 {
 	struct mboxctl_context context;
 	int rc;
+
+	silent = false;
 	
 	rc = init_dbus_dev(&context);
 	if (rc < 0) {
-		fprintf(stderr, "Failed to init dbus\n");
+		MSG_ERR("Failed to init dbus\n");
 		goto out;
 	}
 

@@ -77,8 +77,9 @@
 #define BOOT_HICR7		0x30000e00U
 #define BOOT_HICR8		0xfe0001ffU
 
-static int sighup = 0;
-static int sigint = 0;
+static sig_atomic_t sighup = 0;
+static sig_atomic_t sigint = 0;
+static bool dbus_terminate = 0;
 
 /* We need to keep track of this because we may resize windows due to V1 bugs */
 static uint32_t default_window_size = 0;
@@ -565,6 +566,8 @@ static void alloc_window_dirty_bitmap(struct mbox_context *context)
 static void reset_windows(struct mbox_context *context, bool do_flush)
 {
 	int i;
+
+	set_bmc_events(context, BMC_EVENT_WINDOW_RESET, 1);
 
 	/* We might have an open window which needs closing/flushing */
 	if (context->current) {
@@ -1423,14 +1426,6 @@ static int dbus_handle_reset(struct mbox_context *context,
 		return -MBOX_R_PARAM_ERROR;
 	}
 
-	/* Tell the host its windows have been reset */
-	rc = set_bmc_events(context, BMC_EVENT_WINDOW_RESET, 1);
-	if (rc < 0) {
-		resp->cmd = E_DBUS_HARDWARE;
-		/* Better not reset them since we failed to notify the host */
-		return rc;
-	}
-
 	/*
 	 * This will close (and flush) the current window and point the lpc bus
 	 * mapping back to flash.
@@ -1442,6 +1437,20 @@ static int dbus_handle_reset(struct mbox_context *context,
 	}
 
 	return rc;
+}
+
+/*
+ * Command: DBUS Kill
+ * Stop the daemon
+ *
+ * Args: NONE
+ * Resp: NONE
+ */
+static int dbus_handle_kill(void)
+{
+	dbus_terminate = 1;
+
+	return 0;
 }
 
 /*
@@ -1457,16 +1466,6 @@ static int dbus_handle_reset(struct mbox_context *context,
 static int dbus_handle_modified(struct mbox_context *context,
 				struct mbox_dbus_msg *resp)
 {
-	int rc;
-
-	/* Tell the host its windows have been reset */
-	rc = set_bmc_events(context, BMC_EVENT_WINDOW_RESET, 1);
-	if (rc < 0) {
-		resp->cmd = E_DBUS_HARDWARE;
-		/* Better not reset them since we failed to notify the host */
-		return rc;
-	}
-
 	/*
 	 * This will close the current window and invalidate all windows.
 	 * NOTE: we don't flush the current window since there may be
@@ -1532,6 +1531,9 @@ static int dbus_handle_resume(struct mbox_context *context,
 
 	if (req->args[0] == RESUME_FLASH_MODIFIED) {
 		DELETE_ME("Flash Modified\n");
+		/* The flash modified - can no longer trust our erased bitmap */
+		memset(flash_erased.bitmap,
+		       context->flash_size >> flash_erased.erase_size_shift, 0);
 		/* Clear the bit and call the flash modified handler */
 		clr_bmc_events(context, BMC_EVENT_FLASH_CTRL_LOST, 0);
 		return dbus_handle_modified(context, resp);
@@ -1589,6 +1591,9 @@ static int method_cmd(sd_bus_message *m, void *userdata,
 		resp.num_args = 1;
 		resp.args = calloc(resp.num_args, sizeof(*resp.args));
 		dbus_handle_status(context, &resp);
+		break;
+	case DBUS_C_KILL:
+		dbus_handle_kill();
 		break;
 	case DBUS_C_RESET:
 		DELETE_ME("Reset\n");
@@ -1781,24 +1786,13 @@ static int poll_loop(struct mbox_context *context)
 				continue;
 			}
 			if (errno == EINTR && sigint) {
-				MSG_OUT("Caught signal - Exiting...\n");
-				/* Probably best to do this for safety */
-				/* Note we don't flush the current window */
-				rc = point_to_flash(context);
-				/* Not much we can do if this fails */
-				if (rc < 0) {
-					MSG_ERR("WARNING: Failed to point the "
-						"LPC bus back to flash\n"
-						"If the host requires "
-						"this expect problems...\n");
-				}
+				MSG_OUT("Caught Signal - Exiting...\n");
 				sigint = 0;
-				/* By returning we should cleanup nicely */
-				break;
+				break; /* This should mean we clean up nicely */
 			}
 			MSG_ERR("Error from poll(): %s\n", strerror(errno));
 			rc = -errno;
-			break;
+			break; /* This should mean we clean up nicely */
 		}
 
 		/* Event on Polled File Descriptor - Handle It */
@@ -1809,6 +1803,11 @@ static int poll_loop(struct mbox_context *context)
 				MSG_ERR("Error handling DBUS event: %s\n",
 						strerror(-rc));
 			}
+			if (dbus_terminate) {
+				MSG_OUT("DBUS Kill - Exiting...\n");
+				dbus_terminate = 0;
+				break; /* This should mean we clean up nicely */
+			}
 		}
 		if (context->fds[MBOX_FD].revents & POLLIN) {
 			DELETE_ME("MBOX event\n");
@@ -1817,6 +1816,15 @@ static int poll_loop(struct mbox_context *context)
 				MSG_ERR("Error handling MBOX event\n");
 			}
 		}
+	}
+
+	/* Best to do this for safety  - NOTE: No flush of current window */
+	reset_windows(context, false);
+	rc = point_to_flash(context);
+	/* Not much we can do if this fails */
+	if (rc < 0) {
+		MSG_ERR("WARNING: Failed to point the LPC bus back to flash\n"
+			"If the host requires this expect problems...\n");
 	}
 
 	return rc;
@@ -2274,6 +2282,7 @@ int main(int argc, char **argv)
 	if (rc) {
 		goto finish;
 	}
+	dbus_terminate = 0;
 
 	/* Set the LPC bus mapping to point to the physical flash device */
 	rc = point_to_flash(context);

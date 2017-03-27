@@ -28,6 +28,7 @@
 #define DBUS_C_SUSPEND		0x03
 #define DBUS_C_RESUME		0x04
 #define DBUS_C_MODIFIED		0x05
+#define DBUS_C_KILL		0x06
 
 /* Command Args */
 /* Resume */
