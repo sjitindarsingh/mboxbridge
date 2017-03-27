@@ -337,7 +337,7 @@ static int parse_cmdline(struct mboxctl_context *context, int argc, char **argv)
 		return -E_DBUS_INVAL;
 	}
 
-	while ((opt = getopt_long(argc, argv, "psrfs:umvh", long_options, NULL))
+	while ((opt = getopt_long(argc, argv, "psrfue:mvh", long_options, NULL))
 			!= -1)
 	{
 		switch (opt) {
