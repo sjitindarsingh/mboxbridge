@@ -48,7 +48,7 @@
 "\tCommands:\n" \
 "\t\t--ping\t\t\t- ping the daemon (args: 0)\n" \
 "\t\t--status\t\t- check status of the daemon (args: 0)\n" \
-"\t\t--kill\t\t- stop the daemon without flushing any open window (args: 0)\n" \
+"\t\t--kill\t\t\t- stop the daemon (no flush) (args: 0)\n" \
 "\t\t--reset\t\t\t- hard reset the daemon state (args: 0)\n" \
 "\t\t--point-to-flash\t- point the lpc mapping back to flash (args: 0)\n" \
 "\t\t--suspend\t\t- suspend the daemon to inhibit flash accesses (args: 0)\n" \

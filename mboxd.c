@@ -1466,6 +1466,9 @@ static int dbus_handle_kill(void)
 static int dbus_handle_modified(struct mbox_context *context,
 				struct mbox_dbus_msg *resp)
 {
+	/* The flash modified - can no longer trust our erased bitmap */
+	memset(flash_erased.bitmap,
+	       context->flash_size >> flash_erased.erase_size_shift, 0);
 	/*
 	 * This will close the current window and invalidate all windows.
 	 * NOTE: we don't flush the current window since there may be
@@ -1531,9 +1534,6 @@ static int dbus_handle_resume(struct mbox_context *context,
 
 	if (req->args[0] == RESUME_FLASH_MODIFIED) {
 		DELETE_ME("Flash Modified\n");
-		/* The flash modified - can no longer trust our erased bitmap */
-		memset(flash_erased.bitmap,
-		       context->flash_size >> flash_erased.erase_size_shift, 0);
 		/* Clear the bit and call the flash modified handler */
 		clr_bmc_events(context, BMC_EVENT_FLASH_CTRL_LOST, 0);
 		return dbus_handle_modified(context, resp);
