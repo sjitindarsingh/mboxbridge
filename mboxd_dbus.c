@@ -49,6 +49,7 @@
 #include "mboxd_msg.h"
 #include "mboxd_lpc.h"
 #include "mboxd_flash.h"
+#include "mboxd_filesys.h"
 
 typedef int (*mboxd_dbus_handler)(struct mbox_context *, struct mbox_dbus_msg *,
 				  struct mbox_dbus_msg *);
@@ -138,7 +139,11 @@ static int dbus_handle_reset(struct mbox_context *context,
 	 * of this.
 	 */
 	reset_all_windows(context, SET_BMC_EVENT);
-	rc = point_to_flash(context);
+	if (strlen(context->filesys)) {
+		rc = init_filesys(context);
+	} else {
+		rc = point_to_flash(context);
+	}
 	if (rc < 0) {
 		return -E_DBUS_HARDWARE;
 	}

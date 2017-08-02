@@ -46,6 +46,7 @@
 #include "mboxd_msg.h"
 #include "mboxd_windows.h"
 #include "mboxd_flash.h"
+#include "mboxd_filesys.h"
 
 /* Initialisation Functions */
 
@@ -301,7 +302,11 @@ int write_from_window(struct mbox_context *context, uint32_t offset,
 	switch (type) {
 	case WINDOW_ERASED: /* >= V2 ONLY -> block_size == erasesize */
 		flash_offset = context->current->flash_offset + offset_bytes;
-		rc = erase_flash(context, flash_offset, count_bytes);
+		if (strlen(context->filesys)) {
+			rc = 0;
+		} else {
+			rc = erase_flash(context, flash_offset, count_bytes);
+		}
 		if (rc < 0) {
 			MSG_ERR("Couldn't erase flash\n");
 			return rc;
@@ -313,23 +318,33 @@ int write_from_window(struct mbox_context *context, uint32_t offset,
 		 * so we have a special function to make sure that we do this
 		 * correctly without losing data.
 		 */
-		if (log_2(context->mtd_info.erasesize) !=
-						context->block_size_shift) {
+		if ((context->erase_size_shift != context->block_size_shift) &&
+		    !strlen(context->filesys)) {
 			return write_from_window_v1(context, offset_bytes,
 						    count_bytes);
 		}
 		flash_offset = context->current->flash_offset + offset_bytes;
 
 		/* Erase the flash */
-		rc = erase_flash(context, flash_offset, count_bytes);
+		if (strlen(context->filesys)) {
+			rc = 0;
+		} else {
+			rc = erase_flash(context, flash_offset, count_bytes);
+		}
 		if (rc < 0) {
 			return rc;
 		}
 
 		/* Write to the erased flash */
-		rc = write_flash(context, flash_offset,
-				 context->current->mem + offset_bytes,
-				 count_bytes);
+		if (strlen(context->filesys)) {
+			rc = write_file(context, flash_offset,
+					context->current->mem + offset_bytes,
+					count_bytes);
+		} else {
+			rc = write_flash(context, flash_offset,
+					 context->current->mem + offset_bytes,
+					 count_bytes);
+		}
 		if (rc < 0) {
 			return rc;
 		}
@@ -621,7 +636,11 @@ int create_map_window(struct mbox_context *context,
 	}
 
 	/* Copy from flash into the window buffer */
-	rc = copy_flash(context, offset, cur->mem, cur->size);
+	if (strlen(context->filesys)) {
+		rc = copy_file(context, offset, cur->mem, cur->size);
+	} else {
+		rc = copy_flash(context, offset, cur->mem, cur->size);
+	}
 	if (rc < 0) {
 		/* We don't know how much we've copied -> better reset window */
 		reset_window(context, cur);

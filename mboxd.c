@@ -51,12 +51,14 @@
 #include "mboxd_lpc.h"
 #include "mboxd_msg.h"
 #include "mboxd_windows.h"
+#include "mboxd_filesys.h"
 
 #define USAGE \
 "\nUsage: %s [-V | --version] [-h | --help] [-v[v] | --verbose] [-s | --syslog]\n" \
 "\t\t[-n | --window-num <num>]\n" \
 "\t\t[-w | --window-size <size>M]\n" \
-"\t\t-f | --flash <size>[K|M]\n\n" \
+"\t\t-f | --flash <size>[K|M]\n" \
+"\t\t-p | --pnor <path>\n\n" \
 "\t-v | --verbose\t\tBe [more] verbose\n" \
 "\t-s | --syslog\t\tLog output to syslog (pointless without -v)\n" \
 "\t-n | --window-num\tThe number of windows\n" \
@@ -97,19 +99,9 @@ static int poll_loop(struct mbox_context *context)
 			switch (info.ssi_signo) {
 			case SIGINT:
 			case SIGTERM:
+			case SIGHUP:
 				MSG_INFO("Caught Signal - Exiting...\n");
 				context->terminate = true;
-				break;
-			case SIGHUP:
-				/* Host didn't request reset -> Notify it */
-				reset_all_windows(context, SET_BMC_EVENT);
-				rc = point_to_flash(context);
-				if (rc < 0) {
-					MSG_ERR("WARNING: Failed to point the "
-						"LPC bus back to flash on "
-						"SIGHUP\nIf the host requires "
-						"this expect problems...\n");
-				}
 				break;
 			default:
 				MSG_ERR("Unhandled Signal: %d\n",
@@ -192,6 +184,7 @@ static bool parse_cmdline(int argc, char **argv,
 		{ "flash",		required_argument,	0, 'f' },
 		{ "window-size",	optional_argument,	0, 'w' },
 		{ "window-num",		optional_argument,	0, 'n' },
+		{ "pnor",		optional_argument,	0, 'p' },
 		{ "verbose",		no_argument,		0, 'v' },
 		{ "syslog",		no_argument,		0, 's' },
 		{ "version",		no_argument,		0, 'V' },
@@ -204,7 +197,7 @@ static bool parse_cmdline(int argc, char **argv,
 
 	context->current = NULL; /* No current window */
 
-	while ((opt = getopt_long(argc, argv, "f:w::n::vsVh", long_options, NULL))
+	while ((opt = getopt_long(argc, argv, "f:w::n::p::vsVh", long_options, NULL))
 			!= -1) {
 		switch (opt) {
 		case 0:
@@ -251,6 +244,13 @@ static bool parse_cmdline(int argc, char **argv,
 				return false;
 			}
 			break;
+		case 'p':
+			if (strlen(argv[optind]) > 127) {
+				fprintf(stderr, "PNOR filepath exceeds 127 chars\n");
+				return false;
+			}
+			strncpy(context->filesys, argv[optind], 127);
+			break;
 		case 'v':
 			verbosity++;
 			break;
@@ -277,6 +277,9 @@ static bool parse_cmdline(int argc, char **argv,
 	}
 
 	MSG_INFO("Flash size: 0x%.8x\n", context->flash_size);
+	if (strlen(context->filesys)) {
+		MSG_INFO("Using PNOR file: %s\n", context->filesys);
+	}
 
 	if (verbosity) {
 		MSG_INFO("%s logging\n", verbosity == MBOX_LOG_DEBUG ? "Debug" :
@@ -337,13 +340,24 @@ int main(int argc, char **argv)
 		goto finish;
 	}
 
+	if (strlen(context->filesys)) {
+		rc = init_filesys(context);
+		if (rc) {
+			goto finish;
+		}
+	}
+
 	rc = init_mboxd_dbus(context);
 	if (rc) {
 		goto finish;
 	}
 
 	/* Set the LPC bus mapping to point to the physical flash device */
-	rc = point_to_flash(context);
+	if (strlen(context->filesys)) {
+		rc = point_to_memory(context);
+	} else {
+		rc = point_to_flash(context);
+	}
 	if (rc) {
 		goto finish;
 	}

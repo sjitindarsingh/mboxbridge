@@ -45,6 +45,7 @@
 #include "mboxd_msg.h"
 #include "mboxd_windows.h"
 #include "mboxd_lpc.h"
+#include "mboxd_filesys.h"
 
 static int mbox_handle_flush_window(struct mbox_context *context, union mbox_regs *req,
 			     struct mbox_msg *resp);
@@ -145,7 +146,11 @@ static int mbox_handle_reset(struct mbox_context *context,
 {
 	/* Host requested it -> No BMC Event */
 	reset_all_windows(context, NO_BMC_EVENT);
-	return point_to_flash(context);
+	if (strlen(context->filesys)) {
+		return init_filesys(context);
+	} else {
+		return point_to_flash(context);
+	}
 }
 
 /*

@@ -166,6 +166,8 @@ struct mbox_context {
 	uint32_t block_size_shift;
 	/* Actual Flash Info */
 	struct mtd_info_user mtd_info;
+	/* PNOR filesys */
+	char filesys[128];
 };
 
 #endif /* MBOX_H */
