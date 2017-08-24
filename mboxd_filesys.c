@@ -74,6 +74,16 @@ int init_filesys(struct mbox_context *context)
 		c = context->mem + 0x3ff7000;
 		MSG_INFO("HDR: %c%c%c%c\n", *c, *(c + 1), *(c + 2), *(c + 3));
 	}
+
+	/* We know the erase size so we can allocate the flash_erased bytemap */
+	context->erase_size_shift = 12;
+	context->flash_bmap = calloc(context->flash_size >>
+				     context->erase_size_shift,
+				     sizeof(*context->flash_bmap));
+	MSG_DBG("Flash erase size: 0x%.8x\n", 1 << context->erase_size_shift);
+	context->mtd_info.size = 1 << 26;
+	context->mtd_info.erasesize = 1 << 12;
+
 out:
 	close(fd);
 	return rc;

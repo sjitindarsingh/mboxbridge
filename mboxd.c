@@ -335,13 +335,13 @@ int main(int argc, char **argv)
 		goto finish;
 	}
 
-	rc = init_flash_dev(context);
-	if (rc) {
-		goto finish;
-	}
-
 	if (strlen(context->filesys)) {
 		rc = init_filesys(context);
+		if (rc) {
+			goto finish;
+		}
+	} else {
+		rc = init_flash_dev(context);
 		if (rc) {
 			goto finish;
 		}
